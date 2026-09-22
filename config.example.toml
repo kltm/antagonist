@@ -1,0 +1,41 @@
+# ~/.config/antagonist/config.toml
+# Every key is optional; built-in defaults apply when a key or the whole
+# file is absent. Paths may use ~.
+
+default_backend = "codex"
+timeout = 3600            # wall-clock seconds per run
+idle_timeout = 300        # API backends: max seconds of stream silence
+preflight_ttl = 86400     # seconds the harness/model currency check is cached
+preflight_deadline = 40   # wall-clock seconds a cold currency fetch may take in total
+
+[codex]
+effort = "max"            # low | medium | high | xhigh | max
+# model = ""              # omit to use the account default
+
+[agy]
+effort = "high"           # low | medium | high  (pro models: low | high)
+model = "gemini-3.1-pro"  # effort is appended to pro slugs
+
+[claude]
+effort = "max"
+# model = "opus"
+
+[anthropic]
+effort = "max"
+model = "claude-opus-5-5"   # `antagonist preflight` says when a newer opus exists
+key_file = "~/.config/antagonist/anthropic.key"   # or $ANTHROPIC_API_KEY
+base_url = "https://api.anthropic.com"
+max_tokens = 32000
+fallbacks = true          # server-side refusal fallbacks
+
+[moonshot]
+effort = "max"            # kimi-k3: low | high | max
+model = "kimi-k3"
+key_file = "~/.config/antagonist/moonshot.key"    # or $MOONSHOT_API_KEY
+base_url = "https://api.moonshot.ai/v1"
+max_tokens = 32768
+
+[local]
+base_url = "http://127.0.0.1:11434/v1"
+# model = "qwen3:32b"
+max_tokens = 32768
