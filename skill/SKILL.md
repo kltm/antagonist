@@ -85,8 +85,14 @@ breaks comparability between runs). `antagonist preflight` shows the full
 picture; the check is cached for a day. For agy, `antagonist
 backends` must list a `read_file(<repo>/)` grant for the workspace; if it
 says `NONE`, run `antagonist agy-allow <repo>` first, or the first file
-read ends the run. It prints the run directory. Then poll with a bounded
-call:
+read ends the run. agy headless can only read files: every shell command
+(grep included) is auto-denied and ends the run, and it answers from its
+output budget, not a file. So for agy, pre-run any search the review needs
+and attach the hits as evidence (`grep -rn ... > hits.md`, then
+`-e hits.md`), tell it in the prompt to answer in its reply text and write
+no files, and give it a word budget (about 1500 words); an open-ended
+prompt hit the output cap once (2026-09-22) and produced nothing. The run
+prints the run directory. Then poll with a bounded call:
 
 ```
 antagonist status <run-dir> --wait 3600    # returns when done, or after 3600 s (exit 3)
@@ -111,13 +117,19 @@ MCP idle timeout). They do not survive an OOM kill of the worker itself;
 `status` reports that as `died`. Do not use the codex MCP tool for long
 reviews.
 
-Backend choice:
+Backend choice. First decide what the review needs. **Reading** (a diff,
+a plan, a guard script, numbered claims, with all the evidence attached):
+any backend. **Exploration** (finding what the evidence leaves out) or
+**execution** (verifying a finding by running something): codex only. It
+is the one backend that can both read the repository on its own and run a
+check inside its read-only sandbox. claude can search but not execute;
+agy and the API backends can only read what they are given.
 
 | backend | when | default effort |
 |---|---|---|
-| `codex` | default; the track record is here | `max` (never lower for real reviews) |
-| `agy` | codex credits short, or a second vendor on the same prompt | `high` (its ceiling) |
-| `claude` | cheap fresh-context check; same vendor as this session, weakest independence | `max` |
+| `codex` | default; the track record is here; required when the review must explore or execute | `max` (never lower for real reviews) |
+| `agy` | evidence-complete reviews: codex credits short, or a second vendor on the same prompt; 5 to 10 min. It cannot search or run commands headless, so attach any search output as evidence and pass `--max-words` (about 1500); the runner warns when a prompt asks it to search | `high` (its ceiling) |
+| `claude` | cheap fresh-context check; same vendor as this session, weakest independence; can search, not execute | `max` |
 | `anthropic` | API path when the claude login is unavailable | `max` |
 | `moonshot` | third vendor; evidence must be pasted | `max` |
 | `local` | only when a local endpoint is configured | n/a |
@@ -154,9 +166,15 @@ several places.
   as a hardening review from the owner's side, rerun. If it refuses again,
   tell kltm. Do not silently switch backend; the backends differ.
 - agy run fails with "empty response (a tool was denied)": it touched a
-  path outside a granted directory or used a search tool. Reads and
-  listings need a grant per repo: `antagonist agy-allow <repo>`. Pasted
-  evidence needs no grant.
+  path outside a granted directory, or it tried to run a shell command
+  (a grep, a `cat > file` to write its answer). Reads and listings need a
+  grant per repo: `antagonist agy-allow <repo>`; commands are never
+  granted, so attach search output as evidence and rerun. Pasted evidence
+  needs no grant.
+- agy run fails with "agy exited 3" and `stderr.log` says the response
+  "exceeded the output token limit": the answer outgrew the cap. Rerun with
+  a word budget in the prompt and fewer, narrower questions; the partial
+  draft in `stdout.log` is not a result.
 - `status` says `died`: the worker process is gone without writing a
   result. If `status` also prints an `orphan:` line, the backend CLI is
   still running; run the `kill` command it gives before rerunning, or you

@@ -151,6 +151,13 @@ CLI_NOTE = {
         "names."),
 }
 
+# Wording that asks the reviewer to explore. agy headless cannot search or
+# run commands, so such a prompt fails after minutes instead of at once.
+SEARCH_WORDS = re.compile(
+    r"\b(grep|ripgrep|\brg\b|search (?:the|this|for|through|across)|"
+    r"find (?:all|every|any|the) (?:uses?|occurrences?|references?|callers?|call ?sites?)|"
+    r"(?:scan|walk|explore|survey) the (?:repo|repository|codebase|tree|source))\b", re.I)
+
 FRAMING_WORDS = re.compile(
     r"\b(bypass(?:es|ed|ing)?|attack(?:s|er|ing)?|exploit(?:s|ed|ing)?|"
     r"break (?:this|it|the)|jailbreak|hack(?:s|ing)?)\b", re.I)
@@ -585,6 +592,23 @@ def run_codex(run_dir, prompt, o):
 
 
 AGY_PRO_RE = re.compile(r"^(gemini-[\d.]+-pro)(?:-(low|medium|high))?$")
+_AGY_ERROR_RE = re.compile(r"AGY_ERROR:\s*(\{.*\})")
+
+
+def _agy_short_error(run_dir):
+    """': <first line of agy's own short_error>' from stderr.log, or ''."""
+    try:
+        text = open(os.path.join(run_dir, "stderr.log"), errors="replace").read()
+    except OSError:
+        return ""
+    for m in reversed(_AGY_ERROR_RE.findall(text)):
+        try:
+            short = (json.loads(m).get("short_error") or "").strip().splitlines()
+        except ValueError:
+            continue
+        if short:
+            return ": " + short[0][:200]
+    return ""
 
 
 def run_agy(run_dir, prompt, o):
@@ -619,7 +643,7 @@ def run_agy(run_dir, prompt, o):
             if ev.get("event") == "result":
                 result = ev["result"]
     if rc != 0:
-        raise RuntimeError(f"agy exited {rc}; see stderr.log")
+        raise RuntimeError(f"agy exited {rc}{_agy_short_error(run_dir)}; see stderr.log")
     if result is None:
         raise RuntimeError("agy produced no result event; see stdout.log/stderr.log")
     if result.get("status") != "SUCCESS":
@@ -1424,6 +1448,12 @@ def cmd_run(args, cfg):
             die(f"cannot read --prompt-file: {exc}")
     else:
         task = args.prompt
+    if args.max_words is not None:
+        if args.max_words <= 0:
+            die("--max-words must be a positive integer")
+        task = task.rstrip() + (f"\n\nAnswer in at most {args.max_words} words. Prefer fewer, "
+                                "better-evidenced findings over completeness; stop when the budget "
+                                "is spent rather than truncating a finding.\n")
     evidence = resolve_evidence(cwd, args.evidence)
     b = cfg[backend]
     model = (args.model or b.get("model") or "").strip() or None
@@ -1461,6 +1491,10 @@ def cmd_run(args, cfg):
         print("antagonist: note: prompt contains attack/bypass wording; codex's classifier "
               "has refused that framing before. Consider hardening-review phrasing.",
               file=sys.stderr)
+    if backend == "agy" and SEARCH_WORDS.search(task):
+        print("antagonist: note: the prompt asks the reviewer to search or explore; agy headless "
+              "cannot run commands or search tools and a denial ends the run. Run the search "
+              "yourself and attach the output with -e, or use codex.", file=sys.stderr)
     pre_notes, pre_at = [], None
     if preflight_enabled(args):
         try:
@@ -1483,6 +1517,7 @@ def cmd_run(args, cfg):
         "timeout_s": opts["timeout"], "idle_timeout_s": opts["idle_timeout"],
         "error": None,
         "preflight": {"fetched_at": pre_at, "notes": pre_notes},
+        "max_words": args.max_words,
     }
     write_json(os.path.join(run_dir, "meta.json"), meta)
     # opts.json carries the key file *path* (not a secret) so the worker does
@@ -1622,6 +1657,39 @@ def orphaned_child(run_dir):
     return pgid if _group_alive(pgid) else None
 
 
+# Known failure strings and the fix. Matched against the error and the tail
+# of stderr.log; printed by `status` as `hint:`.
+HINTS = [
+    (re.compile(r"tool was denied", re.I),
+     "agy headless cannot run commands or search tools. Attach search output as evidence (-e) "
+     "and check read grants with `antagonist backends`; or use codex."),
+    (re.compile(r"exceeded the output token limit", re.I),
+     "the answer outgrew agy's output cap. Rerun with --max-words (about 1500) and fewer, "
+     "narrower questions; the partial draft in stdout.log is not a result."),
+    (re.compile(r"cybersecurity risk|flagged for possible", re.I),
+     "codex's classifier refused the framing. Rephrase as a hardening review from the "
+     "owner's side (no attack/bypass wording) and rerun."),
+    (re.compile(r"binary not found", re.I),
+     "the backend CLI is not on PATH or in the fallback directories; `antagonist backends`."),
+    (re.compile(r"went silent|incomplete", re.I),
+     "the stream stalled or ended early. Rerun; at `high` rather than `max` for a "
+     "long-reasoning API model."),
+]
+
+
+def hint_for(run_dir, error):
+    tail = ""
+    try:
+        with open(os.path.join(run_dir, "stderr.log"), errors="replace") as fh:
+            tail = fh.read()[-4000:]
+    except OSError:
+        pass
+    for rx, text in HINTS:
+        if rx.search(error or "") or rx.search(tail):
+            return text
+    return None
+
+
 def cmd_status(args, cfg):
     run_dir = resolve_run(args.run)
     secrets = Secrets(cfg)
@@ -1638,6 +1706,9 @@ def cmd_status(args, cfg):
         print(f"usage:          {json.dumps(meta['usage'])}")
     if meta.get("error"):
         print(f"error:          {secrets.redact(meta['error'])}")
+        h = hint_for(run_dir, meta["error"])
+        if h:
+            print(f"hint:           {h}")
     if st == "died":
         pgid = orphaned_child(run_dir)
         if pgid:
@@ -1663,6 +1734,9 @@ def cmd_status(args, cfg):
                 print(f"status:   {st}  ({meta.get('duration_s')}s)")
                 if meta.get("error"):
                     print(f"error:    {secrets.redact(meta['error'])}")
+                    h = hint_for(run_dir, meta["error"])
+                    if h:
+                        print(f"hint:     {h}")
                 break
         else:
             print(f"status:   still {st} after {args.wait}s")
@@ -1739,6 +1813,8 @@ def main(argv=None):
     r.add_argument("--allow-secrets", action="store_true",
                    help="run even if the prompt matches a credential pattern (known values still refuse)")
     r.add_argument("--quiet", "-q", action="store_true", help="do not print the result")
+    r.add_argument("--max-words", type=int, metavar="N",
+                   help="append a word budget to the task (agy has an output cap; ~1500 is safe)")
     r.add_argument("--no-preflight", action="store_true",
                    help="skip the harness/model currency check (also: ANTAGONIST_NO_PREFLIGHT=1)")
     r.add_argument("--refresh", action="store_true", help="refetch the currency check, ignoring the cache")

@@ -582,6 +582,78 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertNotIn("unavailable", out.stderr)
 
 
+class AgyGuidanceTests(unittest.TestCase):
+    """The reader backend: search-shaped prompts are warned about, a word
+    budget is appended, agy's own short error is surfaced, status names the fix."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.root = tempfile.mkdtemp()
+        cfgdir = tempfile.mkdtemp()
+        self.cfg = os.path.join(cfgdir, "config.toml")
+        open(self.cfg, "w").close()
+        # in-process calls (run_agy) resolve the binary from this process's PATH
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.bin + os.pathsep + old_path
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.env = dict(os.environ, PATH=self.bin + os.pathsep + old_path,
+                        ANTAGONIST_RUNS=self.root, ANTAGONIST_CONFIG=self.cfg,
+                        ANTAGONIST_NO_PREFLIGHT="1")
+
+    def _fake(self, name, script):
+        p = os.path.join(self.bin, name)
+        with open(p, "w") as fh:
+            fh.write("#!/bin/bash\n" + script)
+        os.chmod(p, 0o755)
+
+    def test_search_prompt_warns_and_budget_is_appended(self):
+        self._fake("agy", "exit 1\n")
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "--max-words", "300",
+                              "-p", "Please grep the repository for every caller of foo."],
+                             env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertIn("cannot run commands or search tools", out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        prompt = open(os.path.join(rd, "prompt.md")).read()
+        self.assertIn("Answer in at most 300 words", prompt)
+        self.assertEqual(A.read_json(os.path.join(rd, "meta.json"))["max_words"], 300)
+        # a plain review prompt gets no search note
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy",
+                              "-p", "Review the pasted diff against the numbered claims."],
+                             env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotIn("cannot run commands", out.stderr)
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "--max-words", "0", "-p", "x"],
+                             env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 2)
+
+    def test_agy_short_error_is_surfaced(self):
+        self._fake("agy", 'echo \'AGY_ERROR: {"short_error":"Your previous response was cut off because it '
+                          'exceeded the output token limit\\nPlease continue","retryable":false}\' >&2; exit 3\n')
+        run_dir = tempfile.mkdtemp()
+        with self.assertRaises(RuntimeError) as cm:
+            A.run_agy(run_dir, "p", {"cwd": run_dir, "model": None, "effort": None, "timeout": 20})
+        self.assertIn("agy exited 3: Your previous response was cut off", str(cm.exception))
+        self.assertNotIn("Please continue", str(cm.exception))
+
+    def test_status_prints_a_hint_for_known_failures(self):
+        for err, stderr, want in (
+            ("agy returned an empty response (a tool was denied in headless mode): x", "", "Attach search output"),
+            ("agy exited 3; see stderr.log", "AGY_ERROR: exceeded the output token limit", "--max-words"),
+            ("codex exec exited 1; see stderr.log", "flagged for possible cybersecurity risk", "hardening review"),
+            ("something else entirely", "", None)):
+            rd = os.path.join(self.root, "20260101-000000-agy-" + str(abs(hash(err)) % 10**6))
+            os.makedirs(rd)
+            A.write_json(os.path.join(rd, "meta.json"), {"status": "failed", "backend": "agy", "error": err})
+            with open(os.path.join(rd, "stderr.log"), "w") as fh:
+                fh.write(stderr)
+            out = subprocess.run([sys.executable, SCRIPT, "status", rd], env=self.env,
+                                 capture_output=True, text=True, timeout=30)
+            if want:
+                self.assertIn("hint:", out.stdout, err)
+                self.assertIn(want, out.stdout, err)
+            else:
+                self.assertNotIn("hint:", out.stdout, err)
+
+
 class _NoRedact:
     @staticmethod
     def redact(s):

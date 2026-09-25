@@ -176,6 +176,15 @@ The literal command for every CLI run is written to `cmd.txt` in the run
 directory. For API runs `cmd.txt` holds the endpoint and the request body
 with the prompt and the credential elided.
 
+Choose by what the review needs. Reading a diff or plan with all the
+evidence attached: any backend. Finding what the evidence leaves out, or
+verifying a finding by running something: `codex`, the one backend that
+both reads the repository itself and can execute inside its read-only
+sandbox. `claude` can search but not execute; `agy` and the API backends
+only read what they are given. `run` warns when an `agy` prompt asks for
+a search, `--max-words N` appends a word budget (agy has an output cap),
+and `status` prints a `hint:` line naming the fix for known failures.
+
 ### Notes per backend
 
 **codex.** `~/.codex/config.toml` sets its own default effort; the runner
@@ -307,7 +316,11 @@ process-group kill on timeout, agy effort dispatch, died detection.
   good in one review) and `--timeout` wall clock via `SIGALRM`
   in the worker.
 - An agy run whose model tried a denied tool ends `SUCCESS` with an empty
-  response; the runner turns that into a failed run with the stderr note.
+  response; the runner turns that into a failed run with the stderr note. Command
+  grants are not used: under `--sandbox`, agy runs a granted
+  `command(<name>)` only with a matching `unsandboxed(<name>)` grant,
+  which removes confinement, so search output is attached as evidence
+  instead.
 - No cost accounting. Usage is recorded where the backend reports it.
 - The preflight compares versions and catalog ids only. It cannot tell
   whether a newer release changed behaviour, whether a newer model is
