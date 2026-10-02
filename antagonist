@@ -84,7 +84,7 @@ CLI_BACKENDS = ("codex", "agy", "claude")
 
 # Built-in defaults; ~/.config/antagonist/config.toml overrides per backend.
 DEFAULTS = {
-    "default_backend": "codex",
+    "default_backend": "agy",
     "timeout": 3600,        # wall clock per run
     "idle_timeout": 300,    # API backends: max silence on the stream
     "preflight_ttl": 86400,  # seconds the harness/model currency cache is trusted

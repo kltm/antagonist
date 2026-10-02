@@ -2,7 +2,7 @@
 # Every key is optional; built-in defaults apply when a key or the whole
 # file is absent. Paths may use ~.
 
-default_backend = "codex"
+default_backend = "agy"           # codex | agy | claude | anthropic | moonshot | local
 timeout = 3600            # wall-clock seconds per run
 idle_timeout = 300        # API backends: max seconds of stream silence
 preflight_ttl = 86400     # seconds the harness/model currency check is cached

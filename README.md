@@ -23,10 +23,11 @@ The tool does three things and nothing else:
 1. **One prompt shape for every backend.** A reviewer preamble, your task
    text, and every evidence file pasted byte for byte. The wording is
    identical across backends so their output can be compared.
-2. **Backend selection.** OpenAI Codex (`codex` CLI), Google Antigravity
-   (`agy` CLI), Claude Code (`claude` CLI), the Anthropic API, Moonshot's
-   API, or any OpenAI-compatible local endpoint. Each CLI runs read-only
-   in a sandbox; the API backends see only what you paste.
+2. **Backend selection.** Google Antigravity (`agy` CLI, the default),
+   OpenAI Codex (`codex` CLI), Claude Code (`claude` CLI), the Anthropic
+   API, Moonshot's API, or any OpenAI-compatible local endpoint. Each CLI
+   runs in a sandbox with no tool that writes files (agy's shell can write
+   under `/tmp`); the API backends see only what you paste.
 3. **A run directory per review** with the prompt as sent, the literal
    command, the raw output, the result and metadata, so a finding can be
    traced and a run reproduced.
