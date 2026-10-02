@@ -1055,6 +1055,12 @@ def _run_agy_once(run_dir, prompt, o):
                           + trailing.strip() + "\n")
         if rc != 0:
             short, retryable = _agy_short_error(run_dir)
+            if not short:
+                # agy's own model catalog is fetched at start; when that fetch fails
+                # it rejects a slug it serves in the part running next to this one.
+                tail = open(os.path.join(run_dir, "stderr.log"), errors="replace").read()[-2000:]
+                if "not recognized as a known model" in tail:
+                    retryable, short = True, ": a model it serves was 'not recognized' (catalog fetch failed?)"
             raise (AgyRetryable if retryable else RuntimeError)(
                 f"agy exited {rc}{short}; see stderr.log")
         if result is None:

@@ -1055,6 +1055,19 @@ class AgyReviewerTests(unittest.TestCase):
                 self.assertNotIn(SENTINEL, self._read(path), name)
         self.assertIn("<redacted>", self._read(rd, "result.trailing.md"))
 
+    def test_unrecognized_model_at_start_is_retried_once(self):
+        count = os.path.join(self.bin, "count")
+        self._fake(f"cat >/dev/null; n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; "
+                   "if [ $n = 0 ]; then echo 'error: invalid model selection (--model \"gemini-3.1-pro-high\"): "
+                   "model gemini-3.1-pro-high is not recognized as a known model' >&2; exit 1; "
+                   "else echo '" + RESULT_OK % "catalog came back" + "'; fi\n")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(retries=1))
+        self.assertEqual(out["result_text"], "catalog came back")
+        # a real configuration error is not retried
+        self._fake("cat >/dev/null; echo 'error: invalid model selection: gemini-3.1-pro has no \"max\" effort' >&2; exit 1\n")
+        with self.assertRaisesRegex(RuntimeError, "agy exited 1"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(retries=1))
+
     def test_quota_error_is_retried_after_a_pause(self):
         count = os.path.join(self.bin, "count")
         bad = ('{"event":"result","result":{"status":"ERROR","response":"","error":"API error: '
