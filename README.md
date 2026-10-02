@@ -290,8 +290,9 @@ the notes column of a merged split result:
   complete answer, taken as finished when it does. This is a safeguard;
   the one silent run seen so far was the runner's own fault.
 - It adds text after the answer when a background command reports back.
-  Text that follows a system message after the longest reply goes to
-  `result.trailing.md`, not into the result.
+  Text that follows a system message after the longest reply is kept at
+  the end of the result below a marker, and alone in `result.trailing.md`,
+  so a conclusion that arrived late is still in front of the reader.
 - It can stop mid-answer. An answer that ends inside a code block is
   flagged as possibly cut short (any backend).
 
@@ -345,7 +346,7 @@ Override in the config file.
 
 `~/.config/antagonist/config.toml` (optional; see `config.example.toml`).
 Per-backend `model`, `effort`, `key_file`, `base_url`, `max_tokens`, for
-agy also `tools`, `web`, `retries`, `nudges`, `linger` and `stall`, plus top-level `default_backend`,
+agy also `tools`, `web`, `retries`, `nudges`, `linger`, `stall` and `quota_pause`, plus top-level `default_backend`,
 `timeout`, `idle_timeout`, `split_parallel`, `preflight_ttl` and
 `preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS`,
 `ANTAGONIST_CACHE` and `ANTAGONIST_AGY_SETTINGS` override the paths. `base_url`
@@ -439,8 +440,9 @@ the sandbox can write, claim parsing, split, merge and part retry.
 - The cut-short check sees an unclosed code block only; an answer that
   stops early in prose is not flagged.
 - A per-minute request quota on the Gemini Enterprise service has failed
-  parts of an 8-part run (HTTP 429); the attempt is retried once and
-  `retry` reruns what still failed. The runner does not pace requests.
+  parts of an 8-part run (HTTP 429); the attempt is retried after
+  `quota_pause` seconds and `retry` reruns what still failed. The runner
+  does not pace requests.
 - No cost accounting. Usage is recorded where the backend reports it.
 - The preflight compares versions and catalog ids only. It cannot tell
   whether a newer release changed behaviour, whether a newer model is

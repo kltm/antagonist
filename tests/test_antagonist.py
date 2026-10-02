@@ -938,7 +938,8 @@ class AgyReviewerTests(unittest.TestCase):
         self._stream(events)
         rd = tempfile.mkdtemp()
         out = A.run_agy(rd, "p", self._opts())
-        self.assertEqual(out["result_text"], answer)
+        self.assertTrue(out["result_text"].startswith(answer.rstrip() + "\n\n" + A.AGY_TRAILING_MARK))
+        self.assertTrue(out["result_text"].rstrip().endswith(late))
         self.assertEqual(self._read(rd, "result.trailing.md"), late)
         self.assertIn("result.trailing.md", out["extra"]["notes"][0])
         # a second reply that no system message precedes is part of the answer
@@ -1053,6 +1054,17 @@ class AgyReviewerTests(unittest.TestCase):
             if os.path.isfile(path):
                 self.assertNotIn(SENTINEL, self._read(path), name)
         self.assertIn("<redacted>", self._read(rd, "result.trailing.md"))
+
+    def test_quota_error_is_retried_after_a_pause(self):
+        count = os.path.join(self.bin, "count")
+        bad = ('{"event":"result","result":{"status":"ERROR","response":"","error":"API error: '
+               'RESOURCE_EXHAUSTED (code 429): Quota exceeded for quota metric Requests"}}')
+        self._fake(f"cat >/dev/null; n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; "
+                   f"if [ $n = 0 ]; then echo '{bad}'; else echo '" + RESULT_OK % "after the pause" + "'; fi\n")
+        t0 = time.monotonic()
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(retries=1, quota_pause=1.5))
+        self.assertEqual(out["result_text"], "after the pause")
+        self.assertGreaterEqual(time.monotonic() - t0, 1.5)
 
 
     def test_stream_without_step_index_and_equal_length_replies(self):

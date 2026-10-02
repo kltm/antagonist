@@ -22,6 +22,7 @@ retries = 1               # extra attempts after an interrupted stream
 nudges = 2                # corrective turns after agy refuses one of its own tool requests
 linger = 180              # seconds of silence after the answer before the runner ends the turn (0 = never)
 stall = 600               # seconds of silence with no answer before the attempt is ended and retried (0 = never)
+quota_pause = 65          # seconds to wait before retrying after a per-minute quota error (HTTP 429)
 
 [claude]
 effort = "max"
