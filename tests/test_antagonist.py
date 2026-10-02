@@ -812,6 +812,15 @@ class AgyReviewerTests(unittest.TestCase):
         self.assertNotIn("--conversation", self._read(rd, "cmd.txt.turn1"))
         nudge = json.loads(self._read(rd, "nudge1.agy.jsonl"))["message"]["content"]
         self.assertIn("nothing may run outside the sandbox", nudge)
+        # the conversation id may be missing from the result and present only on the steps
+        idless = ('{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","state":"DONE",'
+                  '"conversation_id":"c-1","tool_info":{"name":"run_command","output":"x"}}}\n'
+                  '{"event":"result","result":{"status":"SUCCESS","response":"",'
+                  '"denied_actions":[{"action":"unsandboxed","display_name":"RunCommand"}]}}')
+        self._fake(f"in=$(cat); case \"$*\" in *'--conversation c-1'*) echo '" + RESULT_OK % "recovered"
+                   + f"';; *) echo '{idless}';; esac\n")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+        self.assertEqual(out["result_text"], "recovered")
         # a reviewer that keeps asking is stopped after the allowed turns
         self._fake(f"cat >/dev/null; echo '{denied}'\n")
         with self.assertRaisesRegex(RuntimeError, "unsandboxed, after 2 corrective turns"):

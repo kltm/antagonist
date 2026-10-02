@@ -1055,7 +1055,7 @@ def _run_agy_once(run_dir, prompt, o):
         if (result.get("response") or "").strip():
             break
         # SUCCESS with an empty response is agy's shape for a soft-denied tool.
-        cid = result.get("conversation_id")
+        cid = result.get("conversation_id") or stream.conversation_id
         if not (denied and cid and turn < nudges):
             note = open(os.path.join(run_dir, "stderr.log"), errors="replace").read().strip()
             what = ", ".join(sorted({str(d.get("action")) for d in denied_all if isinstance(d, dict)}))

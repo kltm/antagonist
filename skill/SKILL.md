@@ -75,7 +75,7 @@ antagonist run -b codex --effort max -f /path/to/prompt.md \
 
 antagonist run -b agy --effort high -f /path/to/prompt.md \
     -e path/relative/to/cwd -e /abs/path --cwd /path/to/repo --label slug \
-    --split 'C1,C2,C3/C4,C5/*' --max-words 1500 --detach
+    --split 'C1,C2,C3/C4,C5/*' --max-words 1500 --detach   # `*` = the remaining claims; it must match at least one
 ```
 
 Replace every value before showing or running it; pass `--effort`
