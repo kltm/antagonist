@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -415,14 +416,15 @@ class CliBackendTests(unittest.TestCase):
             A.run_codex(self.run_dir, "p", opts)
         cmd = open(os.path.join(self.run_dir, "cmd.txt")).read()
         self.assertIn("project_doc_max_bytes=0", cmd)
-        self.assertIn("< prompt.md", cmd)
+        self.assertIn("< " + os.path.join(self.run_dir, "prompt.md"), cmd)
 
     def test_agy_empty_response_fails_and_stdin_recorded(self):
         opts = {"cwd": "/", "model": "gemini-3.1-pro", "effort": "high", "timeout": 20}
         self._fake("agy", 'cat >/dev/null; echo \'{"event":"result","result":{"status":"SUCCESS","response":"","usage":{}}}\'; echo "jetski: no output produced" >&2; exit 0\n')
         with self.assertRaisesRegex(RuntimeError, "empty response"):
             A.run_agy(self.run_dir, "p", opts)
-        self.assertIn("< prompt.agy.jsonl", open(os.path.join(self.run_dir, "cmd.txt")).read())
+        self.assertIn("< " + os.path.join(self.run_dir, "prompt.agy.jsonl"),
+                      open(os.path.join(self.run_dir, "cmd.txt")).read())
         line = json.loads(open(os.path.join(self.run_dir, "prompt.agy.jsonl")).read())
         self.assertEqual(line["event"], "user")
         self.assertIn("--model gemini-3.1-pro-high", open(os.path.join(self.run_dir, "cmd.txt")).read())
@@ -596,9 +598,10 @@ class AgyGuidanceTests(unittest.TestCase):
         old_path = os.environ["PATH"]
         os.environ["PATH"] = self.bin + os.pathsep + old_path
         self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.settings = os.path.join(cfgdir, "agy-settings.json")   # absent: tools = read
         self.env = dict(os.environ, PATH=self.bin + os.pathsep + old_path,
                         ANTAGONIST_RUNS=self.root, ANTAGONIST_CONFIG=self.cfg,
-                        ANTAGONIST_NO_PREFLIGHT="1")
+                        ANTAGONIST_NO_PREFLIGHT="1", ANTAGONIST_AGY_SETTINGS=self.settings)
 
     def _fake(self, name, script):
         p = os.path.join(self.bin, name)
@@ -606,21 +609,29 @@ class AgyGuidanceTests(unittest.TestCase):
             fh.write("#!/bin/bash\n" + script)
         os.chmod(p, 0o755)
 
-    def test_search_prompt_warns_and_budget_is_appended(self):
+    def test_budget_is_appended_and_tools_mode_follows_agy_settings(self):
         self._fake("agy", "exit 1\n")
         out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "--max-words", "300",
                               "-p", "Please grep the repository for every caller of foo."],
                              env=self.env, capture_output=True, text=True, timeout=60)
-        self.assertIn("cannot run commands or search tools", out.stderr)
+        self.assertIn("agy tools: read", out.stderr)
         rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
         prompt = open(os.path.join(rd, "prompt.md")).read()
         self.assertIn("Answer in at most 300 words", prompt)
+        self.assertIn("You have no shell", prompt)
         self.assertEqual(A.read_json(os.path.join(rd, "meta.json"))["max_words"], 300)
-        # a plain review prompt gets no search note
-        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy",
-                              "-p", "Review the pasted diff against the numbered claims."],
+        # agy's own settings decide whether the shell is offered
+        with open(self.settings, "w") as fh:
+            json.dump({"toolPermission": "proceed-in-sandbox"}, fh)
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "-p", "x"],
                              env=self.env, capture_output=True, text=True, timeout=60)
-        self.assertNotIn("cannot run commands", out.stderr)
+        self.assertIn("agy tools: exec", out.stderr)
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "--tools", "read", "-p", "x"],
+                             env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertIn("agy tools: read (requested)", out.stderr)
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "moonshot", "--tools", "read", "-p", "x"],
+                             env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 2)
         out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "--max-words", "0", "-p", "x"],
                              env=self.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 2)
@@ -636,7 +647,9 @@ class AgyGuidanceTests(unittest.TestCase):
 
     def test_status_prints_a_hint_for_known_failures(self):
         for err, stderr, want in (
-            ("agy returned an empty response (a tool was denied in headless mode): x", "", "Attach search output"),
+            ("agy returned an empty response (a tool was denied in headless mode): x", "", "toolPermission"),
+            ("agy sandbox failed to start: its shell commands returned x", "", "agy-check"),
+            ("2 of 5 parts failed (03: x). Finished parts are in result.partial.md", "", "antagonist retry"),
             ("agy exited 3; see stderr.log", "AGY_ERROR: exceeded the output token limit", "--max-words"),
             ("codex exec exited 1; see stderr.log", "flagged for possible cybersecurity risk", "hardening review"),
             ("something else entirely", "", None)):
@@ -652,6 +665,464 @@ class AgyGuidanceTests(unittest.TestCase):
                 self.assertIn(want, out.stdout, err)
             else:
                 self.assertNotIn("hint:", out.stdout, err)
+
+
+RESULT_OK = '{"event":"result","result":{"status":"SUCCESS","response":"%s","usage":{"input_tokens":3}}}'
+
+
+class AgyReviewerTests(unittest.TestCase):
+    """The agy recipe: generated read-only agent in a workspace inside the run
+    dir, review dir attached, JAVA_HOME removed, status checked, one retry,
+    sandbox failure detected, claim-group split with merge and retry."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.root = tempfile.mkdtemp()
+        cfgdir = tempfile.mkdtemp()
+        self.cfg = os.path.join(cfgdir, "config.toml")
+        open(self.cfg, "w").close()
+        self.settings = os.path.join(cfgdir, "agy-settings.json")
+        with open(self.settings, "w") as fh:
+            json.dump({"toolPermission": "proceed-in-sandbox"}, fh)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.bin + os.pathsep + old_path
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        old_settings = A.AGY_SETTINGS
+        A.AGY_SETTINGS = self.settings
+        self.addCleanup(setattr, A, "AGY_SETTINGS", old_settings)
+        self.env = dict(os.environ, PATH=self.bin + os.pathsep + old_path,
+                        ANTAGONIST_RUNS=self.root, ANTAGONIST_CONFIG=self.cfg,
+                        ANTAGONIST_NO_PREFLIGHT="1", ANTAGONIST_AGY_SETTINGS=self.settings,
+                        JAVA_HOME="/opt/fake-jvm")
+
+    def _fake(self, script):
+        p = os.path.join(self.bin, "agy")
+        with open(p, "w") as fh:
+            fh.write("#!/bin/bash\n" + script)
+        os.chmod(p, 0o755)
+
+    def _opts(self, **kw):
+        o = {"cwd": self.root, "model": "gemini-3.1-pro", "effort": "high", "timeout": 20}
+        o.update(kw)
+        return o
+
+    def _read(self, *parts):
+        with open(os.path.join(*parts)) as fh:
+            return fh.read()
+
+    def test_agent_has_no_write_tool_and_review_dir_is_attached(self):
+        run_dir = tempfile.mkdtemp()
+        os.environ["JAVA_HOME"] = "/opt/fake-jvm"
+        self.addCleanup(os.environ.pop, "JAVA_HOME", None)
+        # the response is assembled by the shell so it can show the child's view
+        self._fake('cat >/dev/null; echo "{\\"event\\":\\"result\\",\\"result\\":{\\"status\\":\\"SUCCESS\\",'
+                   '\\"response\\":\\"java=${JAVA_HOME:-unset} cwd=$PWD\\",\\"usage\\":{}}}"\n')
+        extra_dir = tempfile.mkdtemp()
+        out = A.run_agy(run_dir, "p", self._opts(agy_tools="exec", agy_web=True, read_dirs=[extra_dir]))
+        self.assertEqual(out["result_text"], f"java=unset cwd={os.path.join(run_dir, 'ws')}")
+        cmd = self._read(run_dir, "cmd.txt")
+        for want in ("env -u JAVA_HOME", "--agent antagonist-reviewer", "--sandbox",
+                     f"--add-dir {self.root}", f"--add-dir {extra_dir}", "--model gemini-3.1-pro-high"):
+            self.assertIn(want, cmd)
+        agent = self._read(run_dir, "ws", ".agents", "agents", "antagonist-reviewer.md")
+        # exec: the sandboxed shell is the only way to files
+        for tool in ("run_command", "search_web"):
+            self.assertIn(f"  - {tool}\n", agent)
+        for tool in ("write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file",
+                     "view_file", "grep_search"):
+            self.assertNotIn(tool, agent)
+        self.assertIn("commandExecutionPolicy: sandbox", agent)
+        self.assertEqual(out["extra"]["tools_mode"], "exec")
+        # read mode: no shell, no web when switched off
+        run_dir2 = tempfile.mkdtemp()
+        A.run_agy(run_dir2, "p", self._opts(agy_tools="read", agy_web=False))
+        agent = self._read(run_dir2, "ws", ".agents", "agents", "antagonist-reviewer.md")
+        for tool in ("view_file", "grep_search", "find_by_name", "list_dir"):
+            self.assertIn(f"  - {tool}\n", agent)
+        self.assertNotIn("run_command", agent)
+        self.assertNotIn("search_web", agent)
+        self.assertNotIn("write", agent.split("---")[1])
+        self.assertIn("commandExecutionPolicy: off", agent)
+
+    def test_error_status_with_exit_zero_fails_and_is_retried_once(self):
+        run_dir = tempfile.mkdtemp()
+        count = os.path.join(run_dir, "count")
+        bad = '{"event":"result","result":{"status":"ERROR","response":"looks complete","error":"The stream was interrupted."}}'
+        self._fake(f'cat >/dev/null; n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; '
+                   f"if [ $n = 0 ]; then echo '{bad}'; else echo '" + RESULT_OK % "second try" + "'; fi\n")
+        out = A.run_agy(run_dir, "p", self._opts(retries=1))
+        self.assertEqual(out["result_text"], "second try")
+        self.assertEqual(out["extra"]["attempts"], 2)
+        self.assertIn("ERROR", self._read(run_dir, "stdout.log.try1"))
+        self.assertTrue(os.path.exists(os.path.join(run_dir, "cmd.txt.try1")))
+        # no retries configured: the same shape is a failure, never a result
+        os.unlink(count)
+        with self.assertRaisesRegex(RuntimeError, "agy status ERROR"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(retries=0))
+        # a wrong model name is not retried
+        self._fake('cat >/dev/null; echo \'{"event":"result","result":{"status":"ERROR","response":"",'
+                   '"error":"invalid model selection"}}\'\n')
+        rd = tempfile.mkdtemp()
+        with self.assertRaisesRegex(RuntimeError, "invalid model"):
+            A.run_agy(rd, "p", self._opts(retries=3))
+        self.assertFalse(os.path.exists(os.path.join(rd, "stdout.log.try1")))
+
+    def test_sandbox_that_cannot_start_fails_the_run(self):
+        step = ('{"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_info":'
+                '{"name":"run_command","output":"connecting to sandbox server: read unix @->@: connection reset by peer"}}}')
+        self._fake(f"cat >/dev/null; echo '{step}'; echo '" + RESULT_OK % "I inferred everything" + "'\n")
+        with self.assertRaisesRegex(RuntimeError, "sandbox failed to start"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+        ok_step = step.replace("connecting to sandbox server: read unix @->@: connection reset by peer", "42")
+        self._fake(f"cat >/dev/null; echo '{ok_step}'; echo '" + RESULT_OK % "ran it" + "'\n")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+        self.assertEqual(out["extra"]["tool_calls"], {"run_command": 1})
+        # the phrase inside text a command printed (a source file, a README) is not the error
+        quoted = step.replace("connecting to sandbox server: read unix @->@: connection reset by peer",
+                              "AGY_SANDBOX_DOWN = connecting to sandbox server")
+        self._fake(f"cat >/dev/null; echo '{quoted}'; echo '" + RESULT_OK % "read the source" + "'\n")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+        self.assertEqual(out["result_text"], "read the source")
+        wrapped = step.replace("connecting to sandbox server", "Encountered error in tool execution: connecting to sandbox server")
+        self._fake(f"cat >/dev/null; echo '{wrapped}'; echo '" + RESULT_OK % "inferred" + "'\n")
+        with self.assertRaisesRegex(RuntimeError, "sandbox failed to start"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+
+    def test_denied_tool_names_the_action(self):
+        self._fake('cat >/dev/null; echo \'{"event":"result","result":{"status":"SUCCESS","response":"",'
+                   '"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}\'; '
+                   'echo "jetski: no output produced" >&2\n')
+        with self.assertRaisesRegex(RuntimeError, "tool was denied in headless mode: command"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts())
+
+    def test_refused_tool_gets_a_corrective_turn_in_the_same_conversation(self):
+        denied = ('{"event":"result","result":{"status":"SUCCESS","response":"","conversation_id":"c-1",'
+                  '"denied_actions":[{"action":"unsandboxed","display_name":"RunCommand"}]}}')
+        # first call: refused tool; a call that resumes conversation c-1 answers
+        self._fake(f"in=$(cat); case \"$*\" in *'--conversation c-1'*) "
+                   "echo \"{\\\"event\\\":\\\"result\\\",\\\"result\\\":{\\\"status\\\":\\\"SUCCESS\\\","
+                   "\\\"response\\\":\\\"recovered\\\",\\\"conversation_id\\\":\\\"c-1\\\"}}\";; "
+                   f"*) echo '{denied}';; esac\n")
+        rd = tempfile.mkdtemp()
+        out = A.run_agy(rd, "p", self._opts(agy_tools="exec"))
+        self.assertEqual(out["result_text"], "recovered")
+        self.assertEqual(out["extra"]["corrective_turns"], 1)
+        self.assertEqual(out["extra"]["denied_actions"][0]["action"], "unsandboxed")
+        self.assertIn("--conversation c-1", self._read(rd, "cmd.txt"))
+        self.assertNotIn("--conversation", self._read(rd, "cmd.txt.turn1"))
+        nudge = json.loads(self._read(rd, "nudge1.agy.jsonl"))["message"]["content"]
+        self.assertIn("nothing may run outside the sandbox", nudge)
+        # a reviewer that keeps asking is stopped after the allowed turns
+        self._fake(f"cat >/dev/null; echo '{denied}'\n")
+        with self.assertRaisesRegex(RuntimeError, "unsandboxed, after 2 corrective turns"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(agy_tools="exec"))
+
+    def test_claim_parsing_and_split_specs(self):
+        task = ("# Review\n\n## Context\n\n1. not a claim\n\n## Claims to test\n\n"
+                "1. first\n   7. a nested item\n2. second\n- **C3.** third\n**C4.** fourth\n"
+                "```\n9. inside a fence\n```\n~~~\n8. inside a tilde fence\n~~~\n"
+                "````\n```\n10. inside a nested fence\n```\n````\n5) fifth\n"
+                "### Grouped under a subheading\n\n6. sixth\n\n## Out of scope\n\n11. not a claim either\n")
+        self.assertEqual(A.parse_claims(task), ["1", "2", "C3", "C4", "5", "6"])
+        self.assertEqual(A.parse_claims("# Nothing numbered\n\ntext\n"), [])
+        labels = ["1", "2", "3", "4", "5", "6", "7"]
+        self.assertEqual(A.parse_split("auto", labels), [["1", "2", "3"], ["4", "5", "6"], ["7"]])
+        self.assertEqual(A.parse_split("auto:5", labels), [["1", "2", "3", "4", "5"], ["6", "7"]])
+        self.assertEqual(A.parse_split("1,2/3,4,7/*", labels), [["1", "2"], ["3", "4", "7"], ["5", "6"]])
+        self.assertEqual(A.parse_split("c3 / * ", ["1", "C3"]), [["C3"], ["1"]])
+        for bad in ("1,2/3", "1,1/*", "1,9/*", "*/*", "1,,2//3"):
+            with self.assertRaises(SystemExit, msg=bad):
+                A.parse_split(bad, labels)
+
+    PROMPT = "# Task\n\n## Claims to test\n\n1. one\n2. two\n3. three\n4. four\n"
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, SCRIPT, *args], env=self.env, capture_output=True,
+                              text=True, timeout=120)
+
+    def test_split_runs_parts_merges_and_retries_only_failures(self):
+        marker = os.path.join(self.root, "..", "fail-once-" + os.path.basename(self.root))
+        open(marker, "w").close()
+        # part "claims 3, 4" fails while the marker exists; each part reports its own scope
+        self._fake('in=$(cat); scope=$(echo "$in" | grep -o "Review ONLY claims [0-9, ]*" | head -1); '
+                   f'if echo "$scope" | grep -q "3, 4" && [ -e {marker} ]; then exit 1; fi; '
+                   'echo "{\\"event\\":\\"result\\",\\"result\\":{\\"status\\":\\"SUCCESS\\",'
+                   '\\"response\\":\\"saw: $scope\\",\\"usage\\":{\\"input_tokens\\":5}}}"\n')
+        out = self._run("run", "-b", "agy", "--split", "1,2/*", "-p", self.PROMPT)
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("split into 2 parts", out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        meta = A.read_json(os.path.join(rd, "meta.json"))
+        self.assertEqual(meta["status"], "failed")
+        self.assertIn("1 of 2 parts failed", meta["error"])
+        self.assertFalse(os.path.exists(os.path.join(rd, "result.md")))
+        partial = self._read(rd, "result.partial.md")
+        self.assertIn("saw: Review ONLY claims 1, 2", partial)
+        self.assertIn("this part failed", partial)
+        self.assertEqual(self._run("result", rd).returncode, 1)
+        status = self._run("status", rd).stdout
+        self.assertIn("part 02:", status)
+        self.assertIn("antagonist retry", status)
+        # each part got only its own scope, in its own prompt
+        self.assertIn("Review ONLY claims 1, 2.", self._read(rd, "parts", "01", "prompt.md"))
+        self.assertNotIn("Review ONLY", self._read(rd, "prompt.md"))
+        # retry reruns the failed part only
+        os.unlink(marker)
+        first = os.stat(os.path.join(rd, "parts", "01", "stdout.log")).st_mtime_ns
+        self.assertEqual(self._run("retry", rd).returncode, 0)
+        self.assertEqual(os.stat(os.path.join(rd, "parts", "01", "stdout.log")).st_mtime_ns, first)
+        merged = self._run("result", rd)
+        self.assertEqual(merged.returncode, 0)
+        self.assertIn("# Part 01 of 2: claims 1, 2", merged.stdout)
+        self.assertIn("saw: Review ONLY claims 3, 4", merged.stdout)
+        self.assertFalse(os.path.exists(os.path.join(rd, "result.partial.md")))
+        self.assertEqual(A.read_json(os.path.join(rd, "meta.json"))["usage"], {"input_tokens": 10})
+        self.assertEqual(self._run("retry", rd).returncode, 2)   # nothing left to retry
+
+    def test_split_refusals_and_second_model(self):
+        self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
+        self.assertIn("no numbered claims", self._run("run", "-b", "agy", "--split", "auto", "-p", "no list").stderr)
+        self.assertIn("CLI backends", self._run("run", "-b", "local", "--model", "m", "--split", "auto", "-p", self.PROMPT).stderr)
+        self.assertIn("needs --split", self._run("run", "-b", "agy", "--also-model", "m", "-p", self.PROMPT).stderr)
+        self.assertEqual(os.listdir(self.root), [])
+        out = self._run("run", "-b", "agy", "--split", "auto:4", "--also-model", "gemini-3.8-flash",
+                        "-p", self.PROMPT)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        self.assertIn("--model gemini-3.1-pro-high", self._read(rd, "parts", "01", "cmd.txt"))
+        self.assertIn("--model gemini-3.8-flash", self._read(rd, "parts", "02", "cmd.txt"))
+
+    def test_agy_check_requires_evidence_of_execution(self):
+        step = ('{"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_info":'
+                '{"name":"run_command","output":"antagonist-sandbox-42"}}}')
+        self._fake(f"cat >/dev/null; echo '{step}'; echo '" + RESULT_OK % "antagonist-sandbox-42" + "'\n")
+        out = self._run("agy-check")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("PASS", out.stdout)
+        # the model saying the words is not evidence that a command ran
+        self._fake("cat >/dev/null; echo '" + RESULT_OK % "antagonist-sandbox-42" + "'\n")
+        out = self._run("agy-check")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("FAIL", out.stdout)
+
+
+    def _stream(self, events, tail=""):
+        path = os.path.join(self.bin, "events.jsonl")
+        with open(path, "w") as fh:
+            fh.write("".join(json.dumps(e) + "\n" for e in events))
+        self._fake(f"cat >/dev/null; cat {path}; {tail}\n")
+
+    @staticmethod
+    def _step(index, kind, state="DONE", text=None, **kw):
+        su = dict(step_index=index, step_type=kind, state=state, conversation_id="c-9", **kw)
+        if text is not None:
+            su["text_delta"] = text
+        return {"event": "step_update", "step_update": su}
+
+    def test_text_added_after_the_answer_is_set_aside(self):
+        answer, late = "finding one. " * 40, "The background task finished; the review stands."
+        events = [self._step(1, "agent_response", "ACTIVE", answer[:100]),
+                  self._step(1, "agent_response", "ACTIVE", answer[100:]),
+                  self._step(1, "agent_response"),
+                  self._step(2, "system_message"),
+                  self._step(3, "agent_response", "ACTIVE", late), self._step(3, "agent_response"),
+                  {"event": "result", "result": {"status": "SUCCESS", "response": answer + late, "usage": {}}}]
+        self._stream(events)
+        rd = tempfile.mkdtemp()
+        out = A.run_agy(rd, "p", self._opts())
+        self.assertEqual(out["result_text"], answer)
+        self.assertEqual(self._read(rd, "result.trailing.md"), late)
+        self.assertIn("result.trailing.md", out["extra"]["notes"][0])
+        # a second reply that no system message precedes is part of the answer
+        del events[3]
+        self._stream(events)
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts())
+        self.assertEqual(out["result_text"], answer + late)
+        self.assertEqual(out["extra"]["notes"], [])
+
+    def test_turn_held_open_after_the_answer_is_ended(self):
+        old = A.WATCH_POLL
+        A.WATCH_POLL = 0.2
+        self.addCleanup(setattr, A, "WATCH_POLL", old)
+        answer = "finding one. " * 40
+        # a command the reviewer started never finishes; agy would wait for it
+        hung = self._step(1, "tool", "ACTIVE", tool_info={"name": "run_command"})
+        self._stream([hung, self._step(2, "agent_response", "ACTIVE", answer),
+                      self._step(2, "agent_response", usage={"total_tokens": 7})], tail="sleep 60")
+        t0 = time.monotonic()
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(linger=1, timeout=30))
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(out["result_text"], answer)
+        self.assertIn("held the turn open", out["extra"]["notes"][0])
+        self.assertEqual(out["usage"], {"total_tokens": 7})
+        # the newest event is a finished tool call: the reviewer is still working
+        self._stream([self._step(1, "agent_response", "ACTIVE", answer), self._step(1, "agent_response"),
+                      self._step(2, "tool", tool_info={"name": "run_command", "output": "x"})],
+                     tail="sleep 3; echo '" + RESULT_OK % "late but whole" + "'")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(linger=1, timeout=30))
+        self.assertEqual(out["result_text"], "late but whole")
+        self.assertEqual(out["extra"]["notes"], [])
+        # silence with no answer in the stream is not a finished turn
+        self._stream([self._step(1, "agent_response", "ACTIVE", "short"), self._step(1, "agent_response")],
+                     tail="sleep 3; echo '" + RESULT_OK % "whole" + "'")
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(linger=1, timeout=30))
+        self.assertEqual(out["result_text"], "whole")
+
+    def test_watched_run_delivers_a_prompt_larger_than_the_pipe_buffer(self):
+        old = A.WATCH_POLL
+        A.WATCH_POLL = 0.2
+        self.addCleanup(setattr, A, "WATCH_POLL", old)
+        # the child starts reading late: several polls pass with stdin still unread
+        self._fake("sleep 2; wc -c\n")
+        rd = tempfile.mkdtemp()
+        polls = []
+        rc = A._run_cli(rd, ["agy"], "x" * 400_000, rd, 30, watch=lambda: polls.append(1) and None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read(rd, "stdout.log").strip(), "400000")
+        self.assertGreater(len(polls), 3)
+
+    def test_silent_attempt_is_ended_and_retried(self):
+        old = A.WATCH_POLL
+        A.WATCH_POLL = 0.2
+        self.addCleanup(setattr, A, "WATCH_POLL", old)
+        count = os.path.join(self.bin, "count")
+        # first attempt: nothing after the init event, forever; second attempt answers
+        self._fake(f"cat >/dev/null; n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; "
+                   "echo '{\"event\":\"init\",\"init\":{}}'; "
+                   "if [ $n = 0 ]; then sleep 60; else echo '" + RESULT_OK % "second try" + "'; fi\n")
+        rd = tempfile.mkdtemp()
+        t0 = time.monotonic()
+        out = A.run_agy(rd, "p", self._opts(stall=1, retries=1, timeout=30))
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(out["result_text"], "second try")
+        self.assertEqual(out["extra"]["attempts"], 2)
+        self.assertTrue(os.path.exists(os.path.join(rd, "stdout.log.try1")))
+        # no retry left: the silence is the error, not an hour's wait
+        os.unlink(count)
+        with self.assertRaisesRegex(RuntimeError, "agy went silent"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(stall=1, retries=0, timeout=30))
+
+    def test_answer_that_stops_inside_a_code_block_is_flagged(self):
+        self.assertTrue(A.looks_truncated("text\n```diff\n-a\n+b"))
+        self.assertFalse(A.looks_truncated("text\n```diff\n-a\n```\nmore"))
+        self.assertTrue(A.looks_truncated("text\n~~~\ncode"))
+        self.assertFalse(A.looks_truncated("```inline``` is a span, not a fence\nmore"))
+        self.assertFalse(A.looks_truncated("````md\n```\ninner\n```\n````\ndone"))
+        self.assertTrue(A.looks_truncated("````md\n```\ninner\n```\nstill inside"))
+        self._fake("cat >/dev/null; echo '" + RESULT_OK % "patch:\\n```diff\\n-a" + "'\n")
+        out = self._run("run", "-b", "agy", "--split", "auto:4", "-p", self.PROMPT)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        merged = self._read(rd, "result.md")
+        self.assertIn("| status | seconds | notes |", merged)
+        self.assertIn("may be cut short", merged.split("\n---\n")[0])   # in the table, not a part
+        self.assertIn("note:", self._run("status", rd).stdout)
+
+
+    def test_logs_of_retried_attempts_and_set_aside_text_are_redacted(self):
+        answer = "finding one. " * 40
+        count = os.path.join(self.bin, "count")
+        events = os.path.join(self.bin, "ok.jsonl")
+        with open(events, "w") as fh:
+            for e in (self._step(1, "agent_response", "ACTIVE", answer), self._step(1, "agent_response"),
+                      self._step(2, "system_message"),
+                      self._step(3, "agent_response", "ACTIVE", "late " + SENTINEL), self._step(3, "agent_response"),
+                      {"event": "result", "result": {"status": "SUCCESS", "usage": {},
+                                                     "response": answer + "late " + SENTINEL}}):
+                fh.write(json.dumps(e) + "\n")
+        bad = ('{"event":"result","result":{"status":"ERROR","response":"x","error":"The stream was '
+               'interrupted. ' + SENTINEL + '"}}')
+        self._fake(f"cat >/dev/null; n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; "
+                   f"if [ $n = 0 ]; then echo '{bad}'; else cat {events}; fi\n")
+        out = subprocess.run([sys.executable, SCRIPT, "run", "-b", "agy", "-p", "x"], capture_output=True,
+                             text=True, timeout=120, env=dict(self.env, FAKE_API_KEY=SENTINEL))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        for name in ("stdout.log.try1", "result.trailing.md", "stdout.log", "result.md"):
+            self.assertTrue(os.path.exists(os.path.join(rd, name)), name)
+        for name in os.listdir(rd):
+            path = os.path.join(rd, name)
+            if os.path.isfile(path):
+                self.assertNotIn(SENTINEL, self._read(path), name)
+        self.assertIn("<redacted>", self._read(rd, "result.trailing.md"))
+
+
+    def test_stream_without_step_index_and_equal_length_replies(self):
+        st = A.AgyStream()
+        for su in ({"step_type": "agent_response", "state": "ACTIVE", "text_delta": "one "},
+                   {"state": "ACTIVE", "text_delta": "two "},
+                   {"step_type": "agent_response", "state": "DONE", "text_delta": "three"}):
+            st.feed(json.dumps({"event": "step_update", "step_update": su}))
+        self.assertEqual(st.answer(), ("one two three", ""))
+        self.assertEqual(len(st.steps), 1)
+        # two replies of the same length around a system message: nothing is set aside
+        st = A.AgyStream()
+        for e in (self._step(1, "agent_response", "ACTIVE", "a" * 300), self._step(1, "agent_response"),
+                  self._step(2, "system_message"),
+                  self._step(3, "agent_response", "ACTIVE", "b" * 300), self._step(3, "agent_response")):
+            st.feed(json.dumps(e))
+        self.assertEqual(st.answer(), ("a" * 300 + "b" * 300, ""))
+        self.assertTrue(st.answer_complete())
+        # an answer still being streamed is not complete
+        st = A.AgyStream()
+        st.feed(json.dumps(self._step(1, "agent_response", "ACTIVE", "c" * 300)))
+        self.assertFalse(st.answer_complete())
+
+    def test_part_recorded_done_without_a_result_fails_the_split_run(self):
+        self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
+        out = self._run("run", "-b", "agy", "--split", "1,2/*", "-p", self.PROMPT)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        os.unlink(os.path.join(rd, "parts", "02", "result.md"))
+        old_cfg = A.CONFIG_PATH
+        A.CONFIG_PATH = self.cfg   # in-process worker: the test's empty config, not the user's
+        self.addCleanup(setattr, A, "CONFIG_PATH", old_cfg)
+        self.assertEqual(A.worker(rd, only_failed=True), 1)
+        meta = A.read_json(os.path.join(rd, "meta.json"))
+        self.assertEqual(meta["status"], "failed")
+        self.assertIn("result.md is missing", meta["error"])
+        self.assertFalse(os.path.exists(os.path.join(rd, "result.md")))
+
+    def test_retry_refuses_while_a_backend_process_is_still_running(self):
+        self._fake("cat >/dev/null; exit 1\n")
+        out = self._run("run", "-b", "agy", "--split", "1,2/*", "-p", self.PROMPT)
+        self.assertEqual(out.returncode, 1)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        left = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(left.wait)
+        self.addCleanup(left.kill)
+        with open(os.path.join(rd, "parts", "01", "child.pid"), "w") as fh:
+            fh.write(str(left.pid))
+        out = self._run("retry", rd)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn(f"kill -TERM -- -{left.pid}", out.stderr)
+
+    def test_agy_check_counts_a_command_that_ran_before_a_corrective_turn(self):
+        step = ('{"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_info":'
+                '{"name":"run_command","output":"antagonist-sandbox-42"}}}')
+        denied = ('{"event":"result","result":{"status":"SUCCESS","response":"","conversation_id":"c-1",'
+                  '"denied_actions":[{"action":"unsandboxed","display_name":"RunCommand"}]}}')
+        self._fake(f"in=$(cat); case \"$*\" in *'--conversation c-1'*) echo '" + RESULT_OK % "done"
+                   + f"';; *) echo '{step}'; echo '{denied}';; esac\n")
+        out = self._run("agy-check")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("PASS", out.stdout)
+
+
+    def test_exec_mode_refuses_material_the_sandbox_can_write(self):
+        self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
+        under_tmp = tempfile.mkdtemp(dir="/tmp")
+        self.assertEqual(A.agy_sandbox_writable(under_tmp), "/tmp")
+        self.assertIsNone(A.agy_sandbox_writable(os.path.expanduser("~")))
+        out = self._run("run", "-b", "agy", "--cwd", under_tmp, "-p", "x")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("could change the material", out.stderr)
+        # read mode has no shell: the same directory is fine, and the note names every attached one
+        extra = tempfile.mkdtemp(dir="/tmp")
+        out = self._run("run", "-b", "agy", "--tools", "read", "--cwd", under_tmp, "--read-dir", extra, "-p", "x")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+        self.assertIn(f"under `{under_tmp}` and `{extra}`", self._read(rd, "prompt.md"))
 
 
 class _NoRedact:

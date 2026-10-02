@@ -72,27 +72,45 @@ always refuses.
 ```
 antagonist run -b codex --effort max -f /path/to/prompt.md \
     -e path/relative/to/cwd -e /abs/path --cwd /path/to/repo --label slug --detach
+
+antagonist run -b agy --effort high -f /path/to/prompt.md \
+    -e path/relative/to/cwd -e /abs/path --cwd /path/to/repo --label slug \
+    --split 'C1,C2,C3/C4,C5/*' --max-words 1500 --detach
 ```
 
 Replace every value before showing or running it; pass `--effort`
-explicitly (`max` for codex, claude, anthropic, moonshot; `high` for agy)
-so a config default cannot lower it silently. The run prints
+explicitly (`max` for codex, claude, anthropic, moonshot; `high` for agy,
+its ceiling) so a config default cannot lower it silently. The run prints
 `antagonist: preflight:` notes on stderr when the backend CLI is behind
 its latest release, is off PATH, or the pinned model has a newer sibling
 in its family; relay any note to kltm in the check-in or the result
 report rather than acting on it (a model change is his call, since it
 breaks comparability between runs). `antagonist preflight` shows the full
-picture; the check is cached for a day. For agy, `antagonist
-backends` must list a `read_file(<repo>/)` grant for the workspace; if it
-says `NONE`, run `antagonist agy-allow <repo>` first, or the first file
-read ends the run. agy headless can only read files: every shell command
-(grep included) is auto-denied and ends the run, and it answers from its
-output budget, not a file. So for agy, pre-run any search the review needs
-and attach the hits as evidence (`grep -rn ... > hits.md`, then
-`-e hits.md`), tell it in the prompt to answer in its reply text and write
-no files, and give it a word budget (about 1500 words); an open-ended
-prompt hit the output cap once (2026-09-22) and produced nothing. The run
-prints the run directory. Then poll with a bounded call:
+picture; the check is cached for a day.
+
+**agy runs are split.** One agy run thinks for a few minutes whatever the
+prompt holds, so a prompt with many claims gets a shallow pass on each.
+`--split` runs one review per group of claims in parallel and merges
+them: `auto` takes three claims per part, or name the groups
+(`C1,C2/C3,C4,C7/*`, where `*` is every claim not named). Put claims that
+bear on each other in the same group, because no part sees two groups.
+The prompt needs its numbered claims under a heading that contains the
+word "claims". Add `--also-model gemini-3.8-flash` for anything with a
+production surface: the second model has found defects the first missed.
+Give each part a word budget (`--max-words 1500`). If parts fail,
+`antagonist retry <run-dir>` reruns only those.
+
+agy reviews with a generated agent that has no write tool. In `exec`
+mode its one file tool is a sandboxed shell (no network, the file system
+readable, writes only under /tmp); in `read` mode it has agy's file
+search and read tools under `--cwd` (add other directories with
+`--read-dir`). Both can search the web. `antagonist backends`
+shows which mode `auto` resolves to and warns when the sandbox cannot
+start on this host; `antagonist agy-check` proves it with one sandboxed
+command, and is worth running after agy has updated itself. In `exec`
+mode the prompt may ask for checks by execution; say what to test, not
+merely that testing is allowed. The run prints the run directory. Then
+poll with a bounded call:
 
 ```
 antagonist status <run-dir> --wait 3600    # returns when done, or after 3600 s (exit 3)
@@ -120,23 +138,37 @@ reviews.
 Backend choice. First decide what the review needs. **Reading** (a diff,
 a plan, a guard script, numbered claims, with all the evidence attached):
 any backend. **Exploration** (finding what the evidence leaves out) or
-**execution** (verifying a finding by running something): codex only. It
-is the one backend that can both read the repository on its own and run a
-check inside its read-only sandbox. claude can search but not execute;
-agy and the API backends can only read what they are given.
+**execution** (verifying a finding by running something): codex or agy.
+Both read the repository on their own and run checks inside a sandbox;
+agy only in `exec` mode. claude can search but not execute; the API
+backends can only read what they are given.
 
 | backend | when | default effort |
 |---|---|---|
-| `codex` | default; the track record is here; required when the review must explore or execute | `max` (never lower for real reviews) |
-| `agy` | evidence-complete reviews: codex credits short, or a second vendor on the same prompt; 5 to 10 min. It cannot search or run commands headless, so attach any search output as evidence and pass `--max-words` (about 1500); the runner warns when a prompt asks it to search | `high` (its ceiling) |
+| `codex` | the longest single reasoning pass and the longest track record; use it when it is available | `max` (never lower for real reviews) |
+| `agy` | the default when codex is not available, and a second vendor when it is; always with `--split`; a split review finishes in minutes | `high` (its ceiling) |
 | `claude` | cheap fresh-context check; same vendor as this session, weakest independence; can search, not execute | `max` |
 | `anthropic` | API path when the claude login is unavailable | `max` |
 | `moonshot` | third vendor; evidence must be pasted | `max` |
 | `local` | only when a local endpoint is configured | n/a |
 
-For anything with a rollback plan or a production surface, run codex and
-agy on the same prompt and compare. Timeout default is 3600 s; `max` codex
-reviews of a few hundred lines have taken 20 to 40 minutes.
+For anything with a rollback plan or a production surface, run two
+reviewers on the same prompt and compare: codex and agy when both are
+available, otherwise agy with `--also-model`. Timeout default is 3600 s;
+`max` codex reviews of a few hundred lines have taken 20 to 40 minutes, a
+split agy review about 5 to 10.
+
+A reviewer with a shell can read most of what you can, wherever `--cwd`
+points: agy's sandbox hides `~/.ssh`, `~/.aws/credentials` and a few
+like them, not token files that sit in a repository checkout or under
+`~`. What it reads goes to the model's vendor. Use `--tools read` (file
+tools confined to `--cwd` and `--read-dir`) when the review does not need
+execution and the machine holds secrets the vendor should not see.
+
+In `exec` mode the runner refuses a `--cwd` or `--read-dir` under `/tmp`,
+`/var/tmp` or `~/.cache`: the sandbox lets commands write there, so the
+reviewer could change what it reviews. Attach evidence from such places
+with `-e` (it is pasted), or use `--tools read`.
 
 ## 4. Verify, then relay
 
@@ -148,6 +180,17 @@ before relaying it:
   relayed as fact costs more than the review saved.
 - Give each a disposition: confirmed (with what you ran), refuted (with
   the evidence), or deferred (why).
+- Treat the reviewer's "verified" as a claim, not as evidence. agy has
+  marked a point verified after reading the wrong installed copy of a
+  library; check what it ran (`status` lists tool calls per part, the
+  commands are in each part's `stdout.log`).
+- A split result repeats findings across parts and models. Merge
+  duplicates before relaying, and say which model or part raised each.
+- Read the notes column of a split result (and `note:` lines in
+  `status`): a part whose answer may be cut short, one the runner ended
+  because agy held the turn open, one with text set aside in
+  `result.trailing.md`. A cut-short part is worth a `retry` only if the
+  missing piece matters.
 - Report the reviewer's own evidence status (what it verified vs inferred).
 
 Relay in that shape. Do not paste the raw output as the answer.
@@ -165,12 +208,21 @@ several places.
 - Codex refuses ("flagged for possible cybersecurity risk"): rephrase once
   as a hardening review from the owner's side, rerun. If it refuses again,
   tell kltm. Do not silently switch backend; the backends differ.
-- agy run fails with "empty response (a tool was denied)": it touched a
-  path outside a granted directory, or it tried to run a shell command
-  (a grep, a `cat > file` to write its answer). Reads and listings need a
-  grant per repo: `antagonist agy-allow <repo>`; commands are never
-  granted, so attach search output as evidence and rerun. Pasted evidence
-  needs no grant.
+- agy run fails with "empty response (a tool was denied ...)": the runner
+  already resumed the conversation twice telling the reviewer to carry on
+  without the refused tool, and it kept asking. The error names the
+  action. `command`: agy's settings lack `"toolPermission":
+  "proceed-in-sandbox"`; that file is kltm's to change, or rerun with
+  `--tools read`. `read_file` (read mode): the reviewer went outside
+  `--cwd`; attach the directory with `--read-dir` and rerun.
+- agy run fails with "sandbox failed to start": its shell is broken on
+  this host (after an agy update, a missing AppArmor profile). Run
+  `antagonist agy-check`, tell kltm what it prints, and rerun with
+  `--tools read` if the review can do without execution. Do not accept a
+  review whose checks never ran.
+- A split run is `failed` with "N of M parts failed": the finished parts
+  are in `result.partial.md`; `antagonist retry <run-dir>` reruns the rest.
+  One interrupted stream per part is retried automatically.
 - agy run fails with "agy exited 3" and `stderr.log` says the response
   "exceeded the output token limit": the answer outgrew the cap. Rerun with
   a word budget in the prompt and fewer, narrower questions; the partial
@@ -192,5 +244,6 @@ several places.
 
 - Run a review against a live production system; review the plan and the
   commands instead.
-- Pass any of the backends' permission-skipping flags.
+- Pass any of the backends' permission-skipping flags, or run agy outside
+  the runner: its default agent writes files in its workspace unasked.
 - Put credentials in evidence, prompts, or labels.

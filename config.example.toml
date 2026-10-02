@@ -7,6 +7,7 @@ timeout = 3600            # wall-clock seconds per run
 idle_timeout = 300        # API backends: max seconds of stream silence
 preflight_ttl = 86400     # seconds the harness/model currency check is cached
 preflight_deadline = 40   # wall-clock seconds a cold currency fetch may take in total
+split_parallel = 6        # --split: parts running at once
 
 [codex]
 effort = "max"            # low | medium | high | xhigh | max
@@ -15,6 +16,12 @@ effort = "max"            # low | medium | high | xhigh | max
 [agy]
 effort = "high"           # low | medium | high  (pro models: low | high)
 model = "gemini-3.1-pro"  # effort is appended to pro slugs
+tools = "auto"            # read | exec | auto (exec when agy's settings allow sandboxed commands)
+web = true                # give the reviewer agy's web search tool
+retries = 1               # extra attempts after an interrupted stream
+nudges = 2                # corrective turns after agy refuses one of its own tool requests
+linger = 180              # seconds of silence after the answer before the runner ends the turn (0 = never)
+stall = 600               # seconds of silence with no answer before the attempt is ended and retried (0 = never)
 
 [claude]
 effort = "max"
@@ -25,7 +32,7 @@ effort = "max"
 model = "claude-opus-5-5"   # `antagonist preflight` says when a newer opus exists
 key_file = "~/.config/antagonist/anthropic.key"   # or $ANTHROPIC_API_KEY
 base_url = "https://api.anthropic.com"
-max_tokens = 32000
+max_tokens = 64000
 fallbacks = true          # server-side refusal fallbacks
 
 [moonshot]

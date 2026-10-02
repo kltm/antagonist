@@ -84,7 +84,10 @@ antagonist run -b codex -f prompt.md -e src/guard.py -e docs/plan.md \
 antagonist status <run-dir> --wait 300    # poll up to 300 s; exit 3 if still running
 antagonist result <run-dir>               # print result.md
 antagonist list                           # recent runs
-antagonist agy-allow <dir>                # grant agy headless read access
+antagonist run -b agy -f prompt.md -e src/guard.py --cwd /path/to/repo \
+    --split auto --detach                 # one run per group of claims, merged
+antagonist retry <run-dir>                # split runs: rerun only the failed parts
+antagonist agy-check                      # can agy run a sandboxed command? (one model call)
 ```
 
 `run` assembles one prompt: a reviewer preamble (numbered findings,
@@ -97,6 +100,23 @@ only when the file does not end with one; the byte count in the heading
 is the file's). Relative evidence paths resolve against
 `--cwd`, not the invoking directory. `--no-preamble` sends the prompt text
 unchanged (no heading, no trimming); evidence is still appended.
+
+`--split` runs one review per group of claims and merges the results. The
+groups come from the numbered list under the first heading in the prompt
+that contains the word "claims" (`1.`, `2)`, `- **C3.**`): `--split auto`
+takes three claims per part, `auto:N` takes N, and `1,2/3,4,7/*` names the
+groups, with `*` for every claim not named; a spec that leaves a claim out
+is refused. Each part is a complete run directory under `parts/NN/` with
+its own prompt (the full prompt plus a scope paragraph), and up to
+`split_parallel` parts run at once. `--also-model M` runs every part on a
+second model too. The run is `done`, and `result.md` exists, only when
+every part is done; otherwise the finished parts are in
+`result.partial.md` and `antagonist retry` reruns the failed ones. Reason
+for the feature: a reviewer given every claim at once spreads a fixed
+amount of reasoning across all of them. On one benchmark prompt, splitting
+doubled what the same model found, and splitting plus a shell brought it
+close to a much slower single run of a stronger setup. A defect that spans
+two groups has no part looking at both: put related claims in one group.
 
 Before anything is written the assembled prompt is scanned for known
 credential values (the configured key files, secret-looking environment
@@ -163,7 +183,7 @@ verify-then-relay rule.
 | backend | mechanism | reads the repo itself | effort scale | default |
 |---|---|---|---|---|
 | `codex` | `codex exec - -s read-only -C <cwd> --ephemeral -o result -c project_doc_max_bytes=0 -c model_reasoning_effort=<e>`; prompt on stdin | yes, read-only sandbox; `AGENTS.md` not loaded | low, medium, high, xhigh, max | max |
-| `agy` | `agy -p '' --input-format stream-json --output-format stream-json --sandbox [--effort <e>] --model <slug>`; prompt as one JSON line on stdin | reads and listings under a granted directory only | low, medium, high (pro models: low, high, carried in the slug) | high |
+| `agy` | `env -u JAVA_HOME agy -p '' --input-format stream-json --output-format stream-json --sandbox --agent antagonist-reviewer --add-dir <cwd> [--effort <e>] --model <slug>`, run from a workspace inside the run directory; prompt as one JSON line on stdin | yes: file search and read under `--cwd` and `--read-dir`; with `--tools exec`, shell commands in agy's sandbox | low, medium, high (pro models: low, high, carried in the slug) | high |
 | `claude` | `claude -p --output-format json --permission-mode plan --tools Read,Grep,Glob --no-session-persistence --safe-mode --strict-mcp-config --disable-slash-commands --effort <e>`; prompt on stdin | yes, read-only tools; no `CLAUDE.md`, hooks, MCP, skills | low, medium, high, xhigh, max | max |
 | `anthropic` | `POST /v1/messages`, streaming, adaptive thinking, `output_config.effort`, server-side refusal fallbacks | no | low, medium, high, xhigh, max | max, `claude-opus-5-5` |
 | `moonshot` | `POST /v1/chat/completions` (OpenAI-compatible), streaming, `reasoning_effort` on kimi-k3 | no | low, high, max | max, `kimi-k3` |
@@ -178,12 +198,12 @@ with the prompt and the credential elided.
 
 Choose by what the review needs. Reading a diff or plan with all the
 evidence attached: any backend. Finding what the evidence leaves out, or
-verifying a finding by running something: `codex`, the one backend that
-both reads the repository itself and can execute inside its read-only
-sandbox. `claude` can search but not execute; `agy` and the API backends
-only read what they are given. `run` warns when an `agy` prompt asks for
-a search, `--max-words N` appends a word budget (agy has an output cap),
-and `status` prints a `hint:` line naming the fix for known failures.
+verifying a finding by running something: `codex` or `agy`, the two that
+read the repository themselves and execute inside a sandbox (`agy` only
+where its sandbox works; `antagonist agy-check` tests it). `claude` can
+search but not execute; the API backends only read what they are given.
+`--max-words N` appends a word budget, and `status` prints a `hint:` line
+naming the fix for known failures.
 
 ### Notes per backend
 
@@ -193,18 +213,86 @@ phrased as "give me the bypass"; phrase reviews as hardening from the
 owner's side. The MCP form of codex is not used here: a long review
 exceeds the MCP idle timeout while the server keeps running.
 
-**agy (Antigravity CLI).** Headless mode cannot prompt, so any tool without
-an allow rule is soft-denied and the run ends with "no output produced".
-`read_file(<dir>/)` rules work and cover both file reads and directory
-listings under that directory (`antagonist agy-allow <dir>` adds one,
-backing up `settings.json` first). Listing or reading outside a granted
-directory, and the search tools, are denied, so the preamble confines the
-model to the workspace and forbids searching. Prompts go in
-over stdin because a single argv string is capped at 128 KiB on Linux.
-Pro models carry effort in the slug (`gemini-3.1-pro-low|high`): the
-runner strips any suffix you passed and appends the normalized effort;
-other models get `--effort`. Usage is attributed to the GCP project agy is
-logged into.
+**agy (Antigravity CLI).** agy's default agent writes files in its
+workspace without asking, headless included, so the runner never uses it.
+Every run gets a workspace inside the run directory (`ws/`) holding one
+generated agent, `antagonist-reviewer`, whose tool list has no write tool.
+The directory under review is attached with `--add-dir`, as is each
+`--read-dir`; no standing read grant in agy's settings is needed.
+
+Two modes, chosen with `--tools` or `[agy] tools`, plus `search_web` in
+both (switch off with `web = false`):
+
+- `read`: agy's file tools (`view_file`, `grep_search`, `find_by_name`,
+  `list_dir`), confined to the attached directories.
+- `exec`: `run_command` only, a shell in agy's terminal sandbox (no
+  network, most of the file system readable, writes only under `/tmp` and
+  cache directories; a request to leave the sandbox is refused headless).
+  The file tools are left out on purpose: they are not sandboxed, their
+  reach is narrower than the shell's, and one refused read ends a turn.
+  Because commands can write under `/tmp`, `/var/tmp` and `~/.cache`, the
+  runner refuses a `--cwd` or `--read-dir` under those in this mode.
+
+`auto`,
+the default, picks `exec` when agy's own `settings.json` has
+`"toolPermission": "proceed-in-sandbox"`, because headless agy refuses
+every command otherwise. That setting is global to agy and is yours to
+make. What else `exec` needs on Linux:
+
+- User namespaces. Where the kernel restricts them for unconfined
+  programs (Ubuntu 24.04: `kernel.apparmor_restrict_unprivileged_userns=1`)
+  the sandbox dies with "connecting to sandbox server: ... connection
+  reset by peer" until an AppArmor profile grants `userns` to the agy
+  binary: `profile agy-sandbox <path-to-agy> flags=(unconfined) { userns, }`.
+  `backends` and `run` warn when no profile under `/etc/apparmor.d` names
+  the binary.
+- No `JAVA_HOME`. With it set, the sandbox tries to add its certificate to
+  the JVM trust store, finds it read-only and exits. The runner removes
+  the variable from agy's environment.
+
+`antagonist agy-check` runs one sandboxed command through agy and passes
+only if the command's own output shows it ran; run it after agy updates
+itself. During a review, a command whose output is the sandbox-connection
+error (not one that merely prints the phrase from a file) fails the run instead of letting the reviewer fall back to
+inference.
+
+agy can exit 0 with status `ERROR` and a complete-looking answer when its
+stream is interrupted; the runner reads the status, treats that as a
+failure and retries once (`retries`), keeping the failed attempt's logs as
+`*.try1`. A refused tool ends the turn `SUCCESS` with an empty response,
+because headless agy cannot ask. The runner then resumes the same
+conversation (`--conversation <id>`) with a message saying what was
+refused and to carry on without it, at most `nudges` times (default 2;
+the earlier turn's logs are kept as `*.turnN`); if the response is still
+empty the run fails naming the refused action. Prompts go in over stdin because a
+single argv string is capped at 128 KiB on Linux. Pro models carry effort
+in the slug (`gemini-3.1-pro-low|high`): the runner strips any suffix you
+passed and appends the normalized effort; other models get `--effort`.
+`high` is the top level these models offer. Usage is attributed to the
+GCP project agy is logged into. agy's "verified" is not reliable on its
+own (it has checked the wrong installed copy of a library and called the
+result verified): check findings before acting on them.
+
+Four things agy does to a turn, and what the runner does about each;
+every case is recorded as a note in `meta.json`, shown by `status` and in
+the notes column of a merged split result:
+
+- It holds the turn open after answering while a command the reviewer
+  started is still running (one that waits on standard input never
+  ends), and emits its result only when `--print-timeout` expires: an
+  answer at 8 minutes, exit at 60. When the newest stream event closes a
+  reply, an answer is in the stream and nothing follows for `linger`
+  seconds (default 180; 0 disables), the runner ends the process and
+  takes the answer from the stream.
+- A turn that goes silent for `stall` seconds (default 600; 0 disables)
+  is ended: retried like an interrupted stream when the stream holds no
+  complete answer, taken as finished when it does. This is a safeguard;
+  the one silent run seen so far was the runner's own fault.
+- It adds text after the answer when a background command reports back.
+  Text that follows a system message after the longest reply goes to
+  `result.trailing.md`, not into the result.
+- It can stop mid-answer. An answer that ends inside a code block is
+  flagged as possibly cut short (any backend).
 
 **claude.** Uses the session login. `--safe-mode` drops `CLAUDE.md`,
 hooks, plugins, MCP servers and skills so the reviewer does not inherit
@@ -255,10 +343,11 @@ Override in the config file.
 ## Config
 
 `~/.config/antagonist/config.toml` (optional; see `config.example.toml`).
-Per-backend `model`, `effort`, `key_file`, `base_url`, `max_tokens`, plus
-top-level `default_backend`, `timeout`, `idle_timeout`, `preflight_ttl`
-and `preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS` and
-`ANTAGONIST_CACHE` override the paths. `base_url`
+Per-backend `model`, `effort`, `key_file`, `base_url`, `max_tokens`, for
+agy also `tools`, `web`, `retries`, `nudges`, `linger` and `stall`, plus top-level `default_backend`,
+`timeout`, `idle_timeout`, `split_parallel`, `preflight_ttl` and
+`preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS`,
+`ANTAGONIST_CACHE` and `ANTAGONIST_AGY_SETTINGS` override the paths. `base_url`
 shapes differ by API: anthropic takes the host (`/v1/messages` is
 appended; a trailing `/v1` is stripped), moonshot and local take the
 OpenAI-style root including `/v1` (`/chat/completions` is appended).
@@ -271,7 +360,7 @@ OpenAI-style root including `/v1` (`/chat/completions` is appended).
 |---|---|
 | `prompt.md` | the assembled prompt |
 | `prompt.agy.jsonl` | agy only: the one-line stream-json message that went to stdin |
-| `cmd.txt` | literal command (with the file that went to stdin), or endpoint + redacted request |
+| `cmd.txt` | literal command, with the directory it ran in and the absolute path of the file that went to stdin; or endpoint + redacted request |
 | `reasoning.md` | API backends: streamed reasoning, when the provider returns any |
 | `opts.json` | resolved options (the key file's path, never its contents) |
 | `launcher.json` | detached runs: the worker's pid and start time as recorded by the launcher |
@@ -281,6 +370,12 @@ OpenAI-style root including `/v1` (`/chat/completions` is appended).
 | `result.md` | the review |
 | `child.pid` | pid of the CLI backend process (its process group is what a timeout kills) |
 | `worker.log` | detached runs only: the worker's own stdout/stderr (normally empty) |
+| `ws/` | agy only: the workspace agy runs in; holds the generated reviewer agent |
+| `stdout.log.try1`, `stderr.log.try1` | agy only: logs of an attempt that was retried |
+| `*.turnN`, `nudgeN.agy.jsonl` | agy only: logs and command of a turn that ended on a refused tool, and the corrective message that followed |
+| `result.trailing.md` | agy only: text agy added after its answer, kept out of the result |
+| `parts/NN/` | split runs: one complete run directory per part |
+| `result.partial.md` | split runs that failed: the parts that finished, merged |
 
 Run directories and the runs root are mode 0700. `status` reports `died`
 when a queued or running run's worker is gone, and prints an `orphan:`
@@ -301,7 +396,13 @@ python3 -m unittest discover -s tests -v
 Stdlib `unittest`, hermetic (temp key files, local SSE server, fake CLI executables):
 credential redaction and refusal, redirect refusal, stream completion
 gating, fallback attribution, evidence byte-exactness and cwd resolution,
-process-group kill on timeout, agy effort dispatch, died detection.
+process-group kill on timeout, agy effort dispatch, died detection, the
+agy reviewer agent (no write tool, review directory attached, `JAVA_HOME`
+removed), status and sandbox-failure gating, retry, corrective turns
+after a refused tool, a prompt larger than the pipe buffer under the
+watch loop, a turn held open after the answer, a silent attempt, text
+added after the answer, an answer cut short, material in a directory
+the sandbox can write, claim parsing, split, merge and part retry.
 
 ## Known limits
 
@@ -315,12 +416,24 @@ process-group kill on timeout, agy effort dispatch, died detection.
   longest the stream may go silent; a kimi-k3 stream stalled mid-word for
   good in one review) and `--timeout` wall clock via `SIGALRM`
   in the worker.
-- An agy run whose model tried a denied tool ends `SUCCESS` with an empty
-  response; the runner turns that into a failed run with the stderr note. Command
-  grants are not used: under `--sandbox`, agy runs a granted
-  `command(<name>)` only with a matching `unsandboxed(<name>)` grant,
-  which removes confinement, so search output is attached as evidence
-  instead.
+- agy `exec` mode depends on host state the runner does not own: agy's
+  `toolPermission` setting, an AppArmor profile where user namespaces are
+  restricted, and agy's own sandbox, which changes between releases. agy
+  updates itself; `antagonist agy-check` is the test.
+- agy's sandbox is not read-only: commands can write under `/tmp` and
+  cache directories, and can read most files the user can, including
+  credential files that sit in a repository checkout. Its output goes to
+  the model.
+- Ending a held-open turn is a judgment from the event stream. A reviewer
+  that answers and then waits longer than `linger` for a command, meaning
+  to add to its answer, loses the addition.
+- The answer is taken as every reply up to the longest one. A short
+  remark before it ("a command is running, I will wait") stays in the
+  result, and text after it is set aside only when a system message
+  separates the two and it is shorter than the answer.
+- `--split` merges by concatenation. Duplicate findings across parts and
+  models are left for the reader, and a defect that needs two claims from
+  different groups can be missed.
 - No cost accounting. Usage is recorded where the backend reports it.
 - The preflight compares versions and catalog ids only. It cannot tell
   whether a newer release changed behaviour, whether a newer model is

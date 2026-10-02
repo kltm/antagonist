@@ -4,7 +4,8 @@ LLM backend and keep a durable record of the run.
 
 Backends (selected with --backend):
   codex      OpenAI Codex CLI, `codex exec`, read-only sandbox, can read the repo
-  agy        Google Antigravity CLI, `agy -p`, sandboxed, reads under granted dirs
+  agy        Google Antigravity CLI, `agy -p`, read-only reviewer agent; searches the
+             repo and, where its sandbox works, runs checks in it
   claude     Claude Code CLI, `claude -p`, safe mode, plan mode, read-only tools
   anthropic  Anthropic Messages API (raw HTTP), evidence must be pasted
   moonshot   Moonshot/Kimi chat completions API (OpenAI-compatible), pasted
@@ -22,6 +23,9 @@ text of its own, before any truncation marker is appended.
 INVARIANT: every run leaves a self-describing directory under the runs root
 (prompt as sent, the exact stdin file, literal command, raw output, result,
 metadata), mode 0700.
+INVARIANT: agy never runs as its default agent, which can write files in its
+workspace without asking; every agy run uses a generated agent that has no
+write tool, in a workspace directory inside the run directory.
 CAVEAT: CLI backends may read the repo with their own tools; API backends
 see only what --evidence pastes in. Paste evidence in both cases: path-only
 prompts produce confident reports from model memory.
@@ -31,6 +35,7 @@ model, so currency is a decision, not a default.
 """
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import glob
 import json
@@ -84,8 +89,13 @@ DEFAULTS = {
     "idle_timeout": 300,    # API backends: max silence on the stream
     "preflight_ttl": 86400,  # seconds the harness/model currency cache is trusted
     "preflight_deadline": 40,  # wall-clock seconds a cold preflight fetch may take in total
+    "split_parallel": 6,    # --split: parts running at once
     "codex": {"effort": "max", "model": None},
-    "agy": {"effort": "high", "model": "gemini-3.1-pro"},
+    # tools: auto = exec when agy's own settings let sandboxed commands run, else read
+    # linger: seconds of stream silence after the answer before the run is ended;
+    # stall: seconds of silence with no answer before the attempt is retried (0 = never)
+    "agy": {"effort": "high", "model": "gemini-3.1-pro", "tools": "auto", "web": True,
+            "retries": 1, "nudges": 2, "linger": 180, "stall": 600},
     "claude": {"effort": "max", "model": None},
     "anthropic": {
         "effort": "max", "model": "claude-opus-5-5",
@@ -137,26 +147,36 @@ CLI_NOTE = {
         "You are running with a read-only sandbox in the workspace `{cwd}`. "
         "You may read files there to check the evidence; do not modify anything. "
         "The evidence pasted below is authoritative for the files it names."),
-    "agy": (
-        "Constraints for this session: you may read and list files only under "
-        "the workspace root `{cwd}`, by absolute path. Do NOT search, do NOT run "
-        "commands, do NOT touch paths outside the workspace: those tools are "
-        "denied in this mode and a denial ends the run with no output. Do not "
-        "modify anything. The evidence pasted below is authoritative for the "
-        "files it names."),
+    "agy:read": (
+        "You can read and search files under {dirs} (view_file, grep_search, "
+        "find_by_name, list_dir, absolute paths). You have no shell and no tool that "
+        "writes. A request to read anywhere else is refused; work from the "
+        "evidence pasted below instead, which is authoritative for the files it "
+        "names. Answer in your reply text."),
+    "agy:exec": (
+        "Your one tool for files is a sandboxed shell: no network, the file system is "
+        "readable (the material under review is at `{cwd}`), writes work only under "
+        "/tmp. Read with cat, sed -n and grep. You have no tool that writes files. "
+        "Never ask to run a command outside the sandbox: that request is refused. USE "
+        "the shell to verify instead of inferring: copy a fragment under review into "
+        "/tmp and run it against ordinary and hostile inputs, test shell or language "
+        "semantics with stand-in commands, read the installed source of a tool whose "
+        "behaviour a claim depends on (first confirm it is the copy and version the "
+        "material actually uses). Mark a point 'verified' only if you ran a command or "
+        "read a source line for it, and name that command or line; otherwise mark it "
+        "'inferred'. Run every command in the foreground and let it finish; put "
+        "`timeout 60` in front of anything that could block or loop, and `< /dev/null` "
+        "after anything that reads standard input; start nothing in the background and "
+        "leave nothing running. Keep scratch files in one directory "
+        "made with `mktemp -d /tmp/review.XXXXXX`. The evidence pasted below is "
+        "authoritative for the files it names. Answer in your reply text, once, as "
+        "your last message; add nothing after it."),
     "claude": (
         "You are running in plan mode with read-only tools in the workspace "
         "`{cwd}`. You may read files there to check the evidence; do not modify "
         "anything. The evidence pasted below is authoritative for the files it "
         "names."),
 }
-
-# Wording that asks the reviewer to explore. agy headless cannot search or
-# run commands, so such a prompt fails after minutes instead of at once.
-SEARCH_WORDS = re.compile(
-    r"\b(grep|ripgrep|\brg\b|search (?:the|this|for|through|across)|"
-    r"find (?:all|every|any|the) (?:uses?|occurrences?|references?|callers?|call ?sites?)|"
-    r"(?:scan|walk|explore|survey) the (?:repo|repository|codebase|tree|source))\b", re.I)
 
 FRAMING_WORDS = re.compile(
     r"\b(bypass(?:es|ed|ing)?|attack(?:s|er|ing)?|exploit(?:s|ed|ing)?|"
@@ -342,15 +362,18 @@ def read_evidence(path):
     return text, len(data)
 
 
-def assemble_prompt(task_text, evidence, backend, cwd, preamble=True):
+def assemble_prompt(task_text, evidence, backend, cwd, preamble=True, note_key=None,
+                    read_dirs=()):
     """`evidence` is a list of absolute paths. With preamble=False the task
     text goes through unchanged (no heading, no trimming); evidence, if any,
-    is still appended."""
+    is still appended. `note_key` selects the CLI note (default: the backend);
+    `read_dirs` are the other directories attached for reading."""
     parts = []
     if preamble:
         parts.append(PREAMBLE)
-        if backend in CLI_NOTE:
-            parts.append(CLI_NOTE[backend].format(cwd=cwd) + "\n")
+        if (note_key or backend) in CLI_NOTE:
+            dirs = " and ".join(f"`{d}`" for d in [cwd] + list(read_dirs))
+            parts.append(CLI_NOTE[note_key or backend].format(cwd=cwd, dirs=dirs) + "\n")
         parts.append("# Task\n\n" + task_text.rstrip() + "\n")
     else:
         parts.append(task_text)
@@ -492,10 +515,16 @@ def _cli_env(exe, on_path):
     return env
 
 
-def _run_cli(run_dir, argv, stdin_text, cwd, timeout, stdin_name="prompt.md"):
+WATCH_POLL = 2.0   # seconds between calls to a _run_cli watch function
+
+
+def _run_cli(run_dir, argv, stdin_text, cwd, timeout, stdin_name="prompt.md", env_drop=(),
+             watch=None, info=None):
     """Run a CLI backend in its own process group with a wall-clock bound.
     PRE: stdin_text is what goes to the child's stdin; when it is not the
     assembled prompt it is saved under stdin_name so cmd.txt reproduces it.
+    watch, if given, is called every WATCH_POLL seconds while the child runs;
+    a truthy return ends the run early and is stored in info["stopped"].
     POST: on timeout the whole process group gets SIGTERM, then SIGKILL after
     10 s regardless of whether the direct child already exited. Processes that
     left the group (their own setsid) are out of reach; that is the scope."""
@@ -507,21 +536,59 @@ def _run_cli(run_dir, argv, stdin_text, cwd, timeout, stdin_name="prompt.md"):
             raise RuntimeError(f"{argv[0]}: binary not found on PATH or in fallback dirs")
         argv = [exe] + list(argv[1:])   # the file that was checked is the file that runs
     env = _cli_env(exe, on_path)
+    for name in env_drop:
+        env.pop(name, None)
     if stdin_name != "prompt.md":
         with open(os.path.join(run_dir, stdin_name), "w") as fh:
             fh.write(stdin_text)
     with open(os.path.join(run_dir, "cmd.txt"), "w") as fh:
-        fh.write(f"cd {shlex.quote(cwd)} && " + " ".join(shlex.quote(a) for a in argv)
-                 + f" < {stdin_name}\n")
+        unset = "".join(f"-u {shlex.quote(n)} " for n in env_drop)
+        fh.write(f"cd {shlex.quote(cwd)} && " + (f"env {unset}" if unset else "")
+                 + " ".join(shlex.quote(a) for a in argv)
+                 + f" < {shlex.quote(os.path.join(run_dir, stdin_name))}\n")
     out_p = os.path.join(run_dir, "stdout.log")
     err_p = os.path.join(run_dir, "stderr.log")
+    stopped = False   # ended by the watch function; the group is already killed
     with open(out_p, "wb") as out, open(err_p, "wb") as err:
         proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
                                 stderr=err, start_new_session=True, env=env)
         with open(os.path.join(run_dir, "child.pid"), "w") as fh:
             fh.write(str(proc.pid))
         try:
-            proc.communicate(stdin_text.encode(), timeout=timeout)
+            if watch is None:
+                proc.communicate(stdin_text.encode(), timeout=timeout)
+            else:
+                # CAVEAT: communicate() cannot be polled here. After its first
+                # TimeoutExpired it stops writing stdin, so a child that had not
+                # yet drained a prompt larger than the pipe buffer never sees
+                # the rest or end-of-input. A thread owns the write instead.
+                def feed():
+                    try:
+                        proc.stdin.write(stdin_text.encode())
+                    except (OSError, ValueError):
+                        pass   # the child exited or was killed first
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except (OSError, ValueError):
+                            pass
+                threading.Thread(target=feed, daemon=True).start()
+                deadline = time.monotonic() + timeout
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    try:
+                        proc.wait(timeout=min(WATCH_POLL, left))
+                        break
+                    except subprocess.TimeoutExpired:
+                        why = watch()
+                        if why:
+                            _kill_group(proc)
+                            stopped = True
+                            if info is not None:
+                                info["stopped"] = why
+                            break
         except subprocess.TimeoutExpired:
             _kill_group(proc)
             raise RuntimeError(f"timed out after {timeout}s")
@@ -530,7 +597,7 @@ def _run_cli(run_dir, argv, stdin_text, cwd, timeout, stdin_name="prompt.md"):
             # (it is in its own session and would keep running and billing).
             _kill_group(proc)
             raise
-    if _group_alive(proc.pid):
+    if not stopped and _group_alive(proc.pid):
         # The child exited but left something in its group: clean it up.
         _kill_group(proc)
     return proc.returncode
@@ -593,29 +660,338 @@ def run_codex(run_dir, prompt, o):
 
 AGY_PRO_RE = re.compile(r"^(gemini-[\d.]+-pro)(?:-(low|medium|high))?$")
 _AGY_ERROR_RE = re.compile(r"AGY_ERROR:\s*(\{.*\})")
+AGY_SETTINGS = os.environ.get(
+    "ANTAGONIST_AGY_SETTINGS", os.path.join(HOME, ".gemini", "antigravity-cli", "settings.json"))
+AGY_AGENT = "antagonist-reviewer"
+AGY_READ_TOOLS = ["view_file", "grep_search", "find_by_name", "list_dir"]
+# A command's whole output when agy's sandbox cannot start. Anchored at the
+# start: a reviewer that prints this phrase from a file it is reading (the
+# runner's own source, a README) has a working sandbox.
+AGY_SANDBOX_DOWN = "connecting to sandbox server"
+_AGY_SANDBOX_DOWN_RE = re.compile(
+    r"\s*(?:Encountered error in tool execution:\s*)?" + re.escape(AGY_SANDBOX_DOWN))
+
+
+class AgyRetryable(RuntimeError):
+    """A failure that a second attempt can cure (interrupted stream)."""
+
+
+def agy_tools_mode(requested):
+    """(mode, why). `exec` needs agy's own settings to let sandboxed commands
+    run unprompted; headless agy refuses every command otherwise."""
+    if requested in ("read", "exec"):
+        return requested, "requested"
+    st = read_json(AGY_SETTINGS, {}) or {}
+    if st.get("toolPermission") == "proceed-in-sandbox":
+        return "exec", "agy settings: toolPermission = proceed-in-sandbox"
+    return "read", ("agy settings lack toolPermission = proceed-in-sandbox; "
+                    "shell commands would be refused")
+
+
+# Where agy's terminal sandbox lets commands write (measured on agy 1.2.14).
+AGY_SANDBOX_WRITABLE = ["/tmp", "/var/tmp", os.path.join(HOME, ".cache")]
+
+
+def agy_sandbox_writable(path):
+    """The writable root that holds `path`, or None."""
+    real = os.path.realpath(path)
+    for root in AGY_SANDBOX_WRITABLE:
+        r = os.path.realpath(root)
+        if real == r or real.startswith(r + os.sep):
+            return root
+    return None
+
+
+def agy_environment(exe):
+    """Notes on host conditions that stop agy's sandbox. Reads only."""
+    notes = []
+    try:
+        restricted = open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").read().strip() == "1"
+    except OSError:
+        restricted = False
+    if restricted and exe:
+        found = False
+        for prof in glob.glob("/etc/apparmor.d/*"):
+            try:
+                if os.path.isfile(prof) and exe in open(prof, errors="replace").read():
+                    found = True
+                    break
+            except OSError:
+                continue
+        if not found:
+            notes.append(f"this kernel restricts unprivileged user namespaces and no AppArmor "
+                         f"profile under /etc/apparmor.d names {exe}: agy's sandbox cannot start")
+    return notes
+
+
+def agy_agent_text(mode, web):
+    """exec: the sandboxed shell is the only way to files, so every read goes
+    through the sandbox's own masking and no file-tool refusal can occur.
+    read: agy's file tools, confined to the attached directories."""
+    tools = ["run_command"] if mode == "exec" else list(AGY_READ_TOOLS)
+    if web:
+        tools.append("search_web")
+    body = ("You are an independent reviewer. You can "
+            + ("run shell commands inside a sandbox and read files through it"
+               if mode == "exec" else "read and search files")
+            + (", and search the web" if web else "")
+            + ". You have no tool that modifies files and must not try to modify anything. "
+              "Answer in your reply text.")
+    return ("---\n"
+            f"name: {AGY_AGENT}\n"
+            "description: Independent reviewer; reads, searches"
+            + (", runs sandboxed checks" if mode == "exec" else "") + "; cannot modify files.\n"
+            "tools:\n" + "".join(f"  - {t}\n" for t in tools)
+            + "mainAgent: true\nsubagent: false\nmodel: inherit\n"
+            f"commandExecutionPolicy: {'sandbox' if mode == 'exec' else 'off'}\n"
+            "---\n" + body + "\n")
+
+
+def agy_workspace(run_dir, mode, web):
+    """A workspace that holds only the reviewer agent. The material under
+    review is attached with --add-dir, so nothing is written into it."""
+    ws = os.path.join(run_dir, "ws")
+    adir = os.path.join(ws, ".agents", "agents")
+    os.makedirs(adir, mode=0o700, exist_ok=True)
+    write_text_atomic(os.path.join(adir, AGY_AGENT + ".md"), agy_agent_text(mode, web))
+    return ws
 
 
 def _agy_short_error(run_dir):
-    """': <first line of agy's own short_error>' from stderr.log, or ''."""
+    """(': <first line of agy's own short_error>' or '', retryable) from stderr.log."""
     try:
         text = open(os.path.join(run_dir, "stderr.log"), errors="replace").read()
     except OSError:
-        return ""
+        return "", False
     for m in reversed(_AGY_ERROR_RE.findall(text)):
         try:
-            short = (json.loads(m).get("short_error") or "").strip().splitlines()
+            obj = json.loads(m)
         except ValueError:
             continue
+        short = (obj.get("short_error") or "").strip().splitlines()
         if short:
-            return ": " + short[0][:200]
-    return ""
+            return ": " + short[0][:200], bool(obj.get("retryable"))
+    return "", False
 
 
-def run_agy(run_dir, prompt, o):
+class AgyStream:
+    """State of one agy stream-json log, fed line by line.
+    steps: [index, step_type, text] in order of first appearance; text is the
+    step's accumulated text_delta. active: indexes seen ACTIVE and not DONE."""
+
+    def __init__(self):
+        self.result, self.tools, self.steps, self.active = None, [], [], set()
+        self.usage, self.conversation_id, self.last_done = {}, None, None
+        self.last_event = None   # (step, state) of the newest step_update
+        self._by_index, self._done = {}, set()
+
+    def feed(self, raw):
+        raw = raw.strip()
+        if not raw:
+            return
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(ev, dict):
+            return
+        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+            self.result = ev["result"]
+            return
+        su = ev.get("step_update") if ev.get("event") == "step_update" else None
+        if not isinstance(su, dict):
+            return
+        self.conversation_id = su.get("conversation_id") or self.conversation_id
+        idx = su.get("step_index")
+        step = self._by_index.get(idx) if idx is not None else None
+        if (step is None and idx is None and self.last_event is not None
+                and self.last_event[1] != "DONE"
+                and su.get("step_type") in (None, self.last_event[0][1])):
+            step = self.last_event[0]   # no index: the step still being streamed
+        if step is None:
+            step = [idx, su.get("step_type"), ""]
+            self.steps.append(step)
+            if idx is not None:
+                self._by_index[idx] = step
+        if isinstance(su.get("text_delta"), str):
+            step[2] += su["text_delta"]
+        self.last_event = (step, su.get("state"))
+        if su.get("state") == "DONE":
+            self.active.discard(idx)
+            self.last_done = step
+            self._done.add(id(step))
+            if isinstance(su.get("tool_info"), dict):
+                ti = su["tool_info"]
+                self.tools.append((str(ti.get("name")), str(ti.get("output") or "")))
+            for k, v in (su.get("usage") or {}).items():
+                if isinstance(v, (int, float)):
+                    self.usage[k] = self.usage.get(k, 0) + v
+        elif su.get("state") == "ACTIVE":
+            self.active.add(idx)
+
+    def answer(self):
+        """(answer, trailing). The answer is every agent_response text up to
+        and including the longest one, plus later ones that no system message
+        precedes. Text agy adds after its answer when a background command
+        reports back is `trailing`, not part of the review."""
+        texts = [(pos, s[2]) for pos, s in enumerate(self.steps)
+                 if s[1] == "agent_response" and s[2].strip()]
+        if not texts:
+            return "", ""
+        main = max(reversed(texts), key=lambda t: len(t[1]))[0]   # the later of two equals
+        kept, trailing, cut = [], [], False
+        for pos, text in texts:
+            if pos > main and not cut:
+                cut = any(s[1] == "system_message" for s in self.steps[main + 1:pos])
+            (trailing if cut else kept).append(text)
+        return "".join(kept), "".join(trailing)
+
+    def answer_complete(self):
+        """An answer of usable length whose longest reply was closed by a DONE event."""
+        texts = [s for s in self.steps if s[1] == "agent_response" and s[2].strip()]
+        if not texts:
+            return False
+        main = max(reversed(texts), key=lambda s: len(s[2]))
+        return id(main) in self._done and len(self.answer()[0].strip()) >= AGY_ANSWER_MIN
+
+
+def agy_stream(run_dir, name="stdout.log"):
+    st = AgyStream()
+    try:
+        fh = open(os.path.join(run_dir, name), errors="replace")
+    except OSError:
+        return st
+    with fh:
+        for raw in fh:
+            st.feed(raw)
+    return st
+
+
+def agy_events(run_dir, name="stdout.log"):
+    """(result or None, tool calls as [(name, output text)]) from a stream log."""
+    st = agy_stream(run_dir, name)
+    return st.result, st.tools
+
+
+AGY_ANSWER_MIN = 200   # characters; shorter text is not taken for a finished answer
+
+
+class AgyWatch:
+    """Watch function for _run_cli; returns a reason to end the run, or None.
+    linger: agy keeps a turn open after its answer while a command the
+    reviewer started is still running (seen: one that reads a terminal that
+    never sends), and emits its result event only when --print-timeout
+    expires: answer at 8 min, exit at 60. CAVEAT: a reviewer that answers and
+    then waits longer than `linger` for a command in order to add to its
+    answer loses that addition.
+    stall: `stall` seconds of silence with no complete answer is reported as
+    STALLED, for the caller to retry; with a complete answer it ends the turn
+    like linger. A safeguard: no stall of agy's own has been observed (the
+    one seen was this runner not delivering stdin).
+    PRE: stall is longer than the longest silent model step or command a
+    review may legitimately contain."""
+
+    STALLED = "agy went silent"
+
+    def __init__(self, path, linger, stall=0):
+        self.path, self.linger, self.stall = path, linger, stall
+        self.stream, self.offset, self.buf = AgyStream(), 0, b""
+        self.last_output = time.monotonic()
+
+    def __call__(self):
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read()
+                self.offset = fh.tell()
+        except OSError:
+            return None
+        if chunk:
+            self.last_output = time.monotonic()
+            lines = (self.buf + chunk).split(b"\n")
+            self.buf = lines.pop()   # an incomplete last line waits for its newline
+            for line in lines:
+                self.stream.feed(line.decode("utf-8", errors="replace"))
+        st = self.stream
+        quiet = time.monotonic() - self.last_output
+        if st.result is not None:
+            return None
+        if self.linger > 0 and quiet >= self.linger and st.last_event is not None:
+            step, state = st.last_event
+            # The newest event closes a reply and no tool call followed it:
+            # nothing is in flight. A command left running from earlier (still
+            # ACTIVE) is what agy is waiting for, so `active` is not consulted.
+            if state == "DONE" and step[1] == "agent_response" and st.answer_complete():
+                return f"agy held the turn open {int(quiet)}s after its answer"
+        if self.stall > 0 and quiet >= self.stall:
+            if st.answer_complete():   # e.g. a tool event arrived after the answer
+                return f"agy held the turn open {int(quiet)}s after its answer"
+            return f"{self.STALLED} for {int(quiet)}s with no complete answer in the stream"
+        return None
+
+
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*$")
+
+
+class Fences:
+    """Line-by-line code-fence state: ``` or ~~~, closed only by a fence of
+    the same character and at least the same length."""
+
+    def __init__(self):
+        self.open = None   # (character, length) while inside a block
+
+    def feed(self, line):
+        """True when the line is a fence line or lies inside a block."""
+        if self.open is None:
+            m = _FENCE_OPEN_RE.match(line)
+            # a backtick fence may not carry a backtick in its info string:
+            # ```code``` at the start of a line is an inline span
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                self.open = (m.group(1)[0], len(m.group(1)))
+                return True
+            return False
+        m = _FENCE_CLOSE_RE.match(line)
+        if m and m.group(1)[0] == self.open[0] and len(m.group(1)) >= self.open[1]:
+            self.open = None
+        return True
+
+
+def looks_truncated(text):
+    """The text stops inside a fenced code block."""
+    f = Fences()
+    for line in text.splitlines():
+        f.feed(line)
+    return f.open is not None
+
+
+AGY_NUDGE = {
+    "read_file": "the file tools cannot read that path; use what the prompt gives you",
+    "unsandboxed": "nothing may run outside the sandbox",
+    "command": "shell commands are not available in this session",
+    "read_url": "pages cannot be fetched in this session",
+}
+
+
+def agy_nudge_text(denied):
+    acts = sorted({str(d.get("action")) for d in denied if isinstance(d, dict)})
+    why = "; ".join(AGY_NUDGE.get(a, f"`{a}` is not available") for a in acts)
+    return (f"Your last tool request was refused ({why}) and would be refused again; do not "
+            "repeat it. Continue with the tools that work and give your complete final answer.")
+
+
+def _run_agy_once(run_dir, prompt, o):
+    """One attempt: the prompt, then up to `nudges` corrective turns in the
+    same conversation when agy ends a turn empty because a tool was refused
+    (headless agy cannot ask, so a refusal otherwise costs the whole run)."""
     model, effort = o["model"], o["effort"]
-    argv = ["agy", "-p", "", "--input-format", "stream-json",
-            "--output-format", "stream-json", "--sandbox",
+    mode = o.get("agy_tools") or "read"
+    ws = agy_workspace(run_dir, mode, bool(o.get("agy_web")))
+    base = ["agy", "-p", "", "--input-format", "stream-json",
+            "--output-format", "stream-json", "--sandbox", "--agent", AGY_AGENT,
             "--print-timeout", f"{max(60, o['timeout'])}s"]
+    for d in [o["cwd"]] + list(o.get("read_dirs") or []):
+        base += ["--add-dir", d]
     effective = effort
     m = AGY_PRO_RE.match(model or "")
     if m:
@@ -624,39 +1000,106 @@ def run_agy(run_dir, prompt, o):
         eff = "high" if eff == "medium" else eff
         model, effective = f"{m.group(1)}-{eff}", eff
     elif effort:
-        argv += ["--effort", effort]
+        base += ["--effort", effort]
     if model:
-        argv += ["--model", model]
-    line = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
-    rc = _run_cli(run_dir, argv, line, o["cwd"], o["timeout"] + 30,
-                  stdin_name="prompt.agy.jsonl")
-    result = None
-    with open(os.path.join(run_dir, "stdout.log"), errors="replace") as fh:
-        for raw in fh:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                ev = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("event") == "result":
-                result = ev["result"]
-    if rc != 0:
-        raise RuntimeError(f"agy exited {rc}{_agy_short_error(run_dir)}; see stderr.log")
-    if result is None:
-        raise RuntimeError("agy produced no result event; see stdout.log/stderr.log")
-    if result.get("status") != "SUCCESS":
-        raise RuntimeError(f"agy status {result.get('status')}: {result.get('error')}")
-    if not (result.get("response") or "").strip():
+        base += ["--model", model]
+    nudges = max(0, int(o.get("nudges", 2)))
+    linger, stall = float(o.get("linger") or 0), float(o.get("stall") or 0)
+    text, stdin_name, argv = prompt, "prompt.agy.jsonl", list(base)
+    tools, denied_all, turn, notes = [], [], 0, []
+    while True:
+        line = json.dumps({"event": "user", "message": {"content": text}}) + "\n"
+        info = {}
+        watch = (AgyWatch(os.path.join(run_dir, "stdout.log"), linger, stall)
+                 if linger > 0 or stall > 0 else None)
+        # JAVA_HOME: with it set, agy's sandbox tries to add its certificate to the
+        # JVM trust store, finds it read-only, and exits; every command then fails.
+        rc = _run_cli(run_dir, argv, line, ws, o["timeout"] + 30,
+                      stdin_name=stdin_name, env_drop=("JAVA_HOME",), watch=watch, info=info)
+        stream = agy_stream(run_dir)
+        result = stream.result
+        tools += stream.tools
+        answer, trailing = stream.answer()
+        if str(info.get("stopped") or "").startswith(AgyWatch.STALLED):
+            raise AgyRetryable(info["stopped"])
+        if info.get("stopped"):
+            rc = 0   # ended by the runner: the exit status is the kill, not agy's verdict
+            if result is None or not (result.get("response") or "").strip():
+                # No result event, or one emptied by the kill: the answer is what agy streamed.
+                if len(answer.strip()) < AGY_ANSWER_MIN:
+                    raise AgyRetryable(f"{info['stopped']}, and the stream holds no answer")
+                result = {"status": "SUCCESS", "response": answer + trailing,
+                          "usage": stream.usage or None,
+                          "conversation_id": stream.conversation_id}
+                notes.append(f"{info['stopped']}; ended by the runner, answer taken from the stream")
+            else:
+                notes.append(f"{info['stopped']}; ended by the runner as agy reported its result")
+        if trailing and result and (answer + trailing).strip() == (result.get("response") or "").strip():
+            write_text_atomic(os.path.join(run_dir, "result.trailing.md"), trailing)
+            notes.append(f"{len(trailing)} characters agy added after its answer are in "
+                         "result.trailing.md, not in the result")
+            result = dict(result, response=answer)
+        if rc != 0:
+            short, retryable = _agy_short_error(run_dir)
+            raise (AgyRetryable if retryable else RuntimeError)(
+                f"agy exited {rc}{short}; see stderr.log")
+        if result is None:
+            raise AgyRetryable("agy produced no result event; see stdout.log/stderr.log")
+        if result.get("status") != "SUCCESS":
+            # agy can exit 0 with status ERROR and a complete-looking response.
+            msg = f"agy status {result.get('status')}: {result.get('error')}"
+            raise (RuntimeError if "invalid model" in str(result.get("error")).lower()
+                   else AgyRetryable)(msg)
+        denied = result.get("denied_actions") or []
+        denied_all += denied
+        if (result.get("response") or "").strip():
+            break
         # SUCCESS with an empty response is agy's shape for a soft-denied tool.
-        note = open(os.path.join(run_dir, "stderr.log"), errors="replace").read().strip()
-        raise RuntimeError("agy returned an empty response (a tool was denied in headless "
-                           f"mode): {note.splitlines()[0][:300] if note else 'no stderr'}")
+        cid = result.get("conversation_id")
+        if not (denied and cid and turn < nudges):
+            note = open(os.path.join(run_dir, "stderr.log"), errors="replace").read().strip()
+            what = ", ".join(sorted({str(d.get("action")) for d in denied_all if isinstance(d, dict)}))
+            raise RuntimeError("agy returned an empty response (a tool was denied in headless "
+                               f"mode{': ' + what if what else ''}"
+                               f"{f', after {turn} corrective turns' if turn else ''}): "
+                               f"{note.splitlines()[0][:300] if note else 'no stderr'}")
+        turn += 1
+        for name in ("stdout.log", "stderr.log", "cmd.txt"):
+            src = os.path.join(run_dir, name)
+            if os.path.exists(src):
+                os.replace(src, f"{src}.turn{turn}")
+        text, stdin_name = agy_nudge_text(denied), f"nudge{turn}.agy.jsonl"
+        argv = list(base) + ["--conversation", cid]
+    if any(_AGY_SANDBOX_DOWN_RE.match(out) for name, out in tools if name == "run_command"):
+        raise RuntimeError("agy sandbox failed to start: its shell commands returned "
+                           f"'{AGY_SANDBOX_DOWN} ...', so nothing was verified by execution")
+    counts = {}
+    for name, _ in tools:
+        counts[name] = counts.get(name, 0) + 1
     return {"result_text": result["response"], "usage": result.get("usage"),
             "model": model or "(agy default)", "raw_status": result.get("status"),
             "extra": {"conversation_id": result.get("conversation_id"),
-                      "num_turns": result.get("num_turns"), "effective_effort": effective}}
+                      "num_turns": result.get("num_turns"), "effective_effort": effective,
+                      "tools_mode": mode, "tool_calls": counts, "denied_actions": denied_all,
+                      "corrective_turns": turn, "notes": notes}}
+
+
+def run_agy(run_dir, prompt, o):
+    """One retry by default: long tool-using turns sometimes end with an
+    interrupted stream. The failed attempt's logs are kept as *.tryN."""
+    attempts = 1 + max(0, int(o.get("retries") or 0))
+    for i in range(1, attempts + 1):
+        try:
+            out = _run_agy_once(run_dir, prompt, o)
+            out["extra"]["attempts"] = i
+            return out
+        except AgyRetryable as exc:
+            if i == attempts:
+                raise RuntimeError(f"{exc}" + (f" (after {attempts} attempts)" if attempts > 1 else ""))
+            for pat in ("std*.log*", "cmd.txt*", "nudge*.agy.jsonl", "result.trailing.md"):
+                for src in glob.glob(os.path.join(run_dir, pat)):
+                    if ".try" not in os.path.basename(src):
+                        os.replace(src, f"{src}.try{i}")
 
 
 def run_claude(run_dir, prompt, o):
@@ -932,10 +1375,10 @@ def probe(backend, cfg, model=None):
             return False, "binary not on PATH nor in fallback dirs"
         note = exe if on_path else f"{exe} (not on PATH; fallback)"
         if backend == "agy":
-            st = read_json(os.path.join(HOME, ".gemini/antigravity-cli/settings.json"), {})
-            grants = [g for g in (st.get("permissions") or {}).get("allow", [])
-                      if g.startswith("read_file(")]
-            note += f"; read grants: {', '.join(grants) or 'NONE (use agy-allow)'}"
+            mode, why = agy_tools_mode(b.get("tools") or "auto")
+            note += f"; tools: {mode} ({why})"
+            if mode == "exec":
+                note += "".join(f"; WARNING: {n}" for n in agy_environment(exe))
         return True, note
     if backend in ("anthropic", "moonshot"):
         kf = b.get("key_file")
@@ -1412,6 +1855,109 @@ def cmd_backends(args, cfg):
             print(f"  - {secrets.redact(n)}")
 
 
+# ---------------------------------------------------------------------- split
+# One run per group of claims, in parallel, merged into one result. A reviewer
+# given every claim at once spreads a fixed amount of reasoning across all of
+# them; given two or three it tests each clause.
+
+_CLAIMS_HEAD_RE = re.compile(r"^(#{1,6})\s+.*\bclaims?\b", re.I)
+_HEAD_RE = re.compile(r"^(#{1,6})\s")
+_CLAIM_ITEM_RE = re.compile(r"^(?:[-*+]\s+)?(?:\*\*)?([A-Za-z]{0,3}\d{1,3})[.)](?:\*\*)?(?:\s|$)")
+
+
+def parse_claims(task):
+    """Labels of the numbered items under the first heading that contains
+    'claim', in order: `1.`, `2)`, `- **C3.**`. Items start at column 0 (an
+    indented item is a sub-point of a claim); fenced blocks are skipped.
+    Stops at the next heading of the same or a higher level, so claims may be
+    grouped under deeper subheadings."""
+    labels, level, fences = [], None, Fences()
+    for line in task.splitlines():
+        if fences.feed(line):
+            continue
+        h = _HEAD_RE.match(line)
+        if level is None:
+            m = _CLAIMS_HEAD_RE.match(line)
+            if m:
+                level = len(m.group(1))
+            continue
+        if h and len(h.group(1)) <= level:
+            break
+        m = _CLAIM_ITEM_RE.match(line)
+        if m and m.group(1) not in labels:
+            labels.append(m.group(1))
+    return labels
+
+
+def parse_split(spec, labels):
+    """`auto` (groups of 3), `auto:N`, or explicit groups `1,2/3,4,7/*` where
+    `*` takes every claim not named elsewhere. Every claim lands in exactly
+    one group or the spec is refused."""
+    spec = spec.strip()
+    m = re.fullmatch(r"auto(?::(\d+))?", spec)
+    if m:
+        size = int(m.group(1) or 3)
+        if size < 1:
+            die("--split auto:N needs N >= 1")
+        return [labels[i:i + size] for i in range(0, len(labels), size)]
+    by_lower = {x.lower(): x for x in labels}
+    groups, seen, star = [], set(), None
+    for gi, chunk in enumerate(re.split(r"[/;]", spec)):
+        names = [x.strip() for x in chunk.split(",") if x.strip()]
+        if not names:
+            die(f"--split: empty group in {spec!r}")
+        if names == ["*"]:
+            if star is not None:
+                die("--split: `*` may appear once")
+            star = gi
+            groups.append(None)
+            continue
+        group = []
+        for n in names:
+            if n.lower() not in by_lower:
+                die(f"--split: no claim labelled {n!r}; the prompt has {', '.join(labels)}")
+            lab = by_lower[n.lower()]
+            if lab in seen:
+                die(f"--split: claim {lab} is in two groups")
+            seen.add(lab)
+            group.append(lab)
+        groups.append(group)
+    rest = [x for x in labels if x not in seen]
+    if star is not None:
+        if not rest:
+            die("--split: `*` matches no remaining claim")
+        groups[star] = rest
+    elif rest:
+        die(f"--split: claims not in any group: {', '.join(rest)} (add them, or a `*` group)")
+    return groups
+
+
+def scope_text(group):
+    which = ("claim " if len(group) == 1 else "claims ") + ", ".join(group)
+    return ("\n# Scope for this pass\n\n"
+            f"This review is split into parts. Review ONLY {which}. Ignore the other claims and "
+            "any question that concerns only them. Split each claim in scope into its separate "
+            "clauses, test every clause against the evidence, and give a verdict per clause. "
+            "Then list defects in the material relevant to these claims that the claims do not "
+            "mention.\n")
+
+
+def merge_parts(parts, metas, results):
+    """One document: a status table, then each part's result in order."""
+    out = [f"# Split review: {len(parts)} parts\n",
+           "| part | claims | model | status | seconds | notes |", "|---|---|---|---|---|---|"]
+    for i, (p, m) in enumerate(zip(parts, metas), 1):
+        notes = "; ".join((m.get("extra") or {}).get("notes") or []).replace("|", "/")
+        out.append(f"| {i:02d} | {', '.join(p['claims'])} | {m.get('model_served') or p.get('model') or ''} "
+                   f"| {m.get('status')} | {m.get('duration_s') or ''} | {notes} |")
+    for i, (p, m, text) in enumerate(zip(parts, metas, results), 1):
+        out.append(f"\n---\n\n# Part {i:02d} of {len(parts)}: claims {', '.join(p['claims'])}"
+                   f" ({m.get('model_served') or p.get('model') or 'default model'})\n")
+        out.append(text.rstrip() if text is not None
+                   else f"[antagonist: this part failed: {m.get('error')}]")
+    return "\n".join(out) + "\n"
+
+
 def new_run_dir(backend, label):
     os.makedirs(RUNS_ROOT, mode=0o700, exist_ok=True)
     os.chmod(RUNS_ROOT, 0o700)
@@ -1470,8 +2016,47 @@ def cmd_run(args, cfg):
     ok, note = probe(backend, cfg, model=model)
     if not ok:
         die(f"backend {backend} unavailable: {note}")
+    note_key = None
+    if args.tools and backend != "agy":
+        die("--tools applies to the agy backend only")
+    read_dirs = [os.path.abspath(d) for d in args.read_dir]
+    for d in read_dirs:
+        if not os.path.isdir(d):
+            die(f"--read-dir {d} is not a directory")
+    if read_dirs and backend != "agy":
+        print(f"antagonist: note: --read-dir is used by agy only; {backend} ignores it",
+              file=sys.stderr)
+    if backend == "agy":
+        mode, why = agy_tools_mode(args.tools or b.get("tools") or "auto")
+        note_key = f"agy:{mode}"
+        opts.update(agy_tools=mode, agy_web=bool(b.get("web", True)),
+                    retries=int(b.get("retries", 1)), nudges=int(b.get("nudges", 2)),
+                    linger=float(b.get("linger", 180)), stall=float(b.get("stall", 600)),
+                    read_dirs=read_dirs)
+        print(f"antagonist: agy tools: {mode} ({why})", file=sys.stderr)
+        if mode == "exec":
+            for d in [cwd] + read_dirs:
+                hit = agy_sandbox_writable(d)
+                if hit:
+                    die(f"{d} is under {hit}, where agy's sandbox lets commands write, so the "
+                        "reviewer could change the material; use --tools read or review a copy "
+                        "kept elsewhere")
+            for n in agy_environment(find_binary("agy")[0]):
+                print(f"antagonist: WARNING: {n}", file=sys.stderr)
+    groups = None
+    if args.split:
+        if backend not in CLI_BACKENDS:
+            die(f"--split is supported for the CLI backends ({', '.join(CLI_BACKENDS)})")
+        labels = parse_claims(task)
+        if not labels:
+            die("--split found no numbered claims: it needs a numbered list under a "
+                "heading that contains the word 'claims'")
+        groups = parse_split(args.split, labels)
+    elif args.also_model:
+        die("--also-model needs --split")
     try:
-        prompt = assemble_prompt(task, evidence, backend, cwd, preamble=not args.no_preamble)
+        prompt = assemble_prompt(task, evidence, backend, cwd, preamble=not args.no_preamble,
+                                 note_key=note_key, read_dirs=read_dirs)
     except ValueError as exc:
         die(str(exc))
     secrets = Secrets(cfg)
@@ -1491,10 +2076,6 @@ def cmd_run(args, cfg):
         print("antagonist: note: prompt contains attack/bypass wording; codex's classifier "
               "has refused that framing before. Consider hardening-review phrasing.",
               file=sys.stderr)
-    if backend == "agy" and SEARCH_WORDS.search(task):
-        print("antagonist: note: the prompt asks the reviewer to search or explore; agy headless "
-              "cannot run commands or search tools and a denial ends the run. Run the search "
-              "yourself and attach the output with -e, or use codex.", file=sys.stderr)
     pre_notes, pre_at = [], None
     if preflight_enabled(args):
         try:
@@ -1519,6 +2100,30 @@ def cmd_run(args, cfg):
         "preflight": {"fetched_at": pre_at, "notes": pre_notes},
         "max_words": args.max_words,
     }
+    if groups:
+        os.makedirs(os.path.join(run_dir, "parts"), mode=0o700)
+        plist = []
+        for group in groups:
+            for pm in [model] + [x.strip() for x in args.also_model if x.strip()]:
+                rel = os.path.join("parts", f"{len(plist) + 1:02d}")
+                pdir = os.path.join(run_dir, rel)
+                os.makedirs(pdir, mode=0o700)
+                ptext = assemble_prompt(task.rstrip() + "\n" + scope_text(group), evidence, backend,
+                                        cwd, preamble=not args.no_preamble, note_key=note_key,
+                                        read_dirs=read_dirs)
+                write_text_atomic(os.path.join(pdir, "prompt.md"), ptext)
+                popts = dict(opts, model=pm,
+                             effort=norm_effort(backend, args.effort or b.get("effort"), pm))
+                write_json(os.path.join(pdir, "opts.json"), popts)
+                write_json(os.path.join(pdir, "meta.json"), dict(
+                    meta, model=pm, effort=popts["effort"], claims=group,
+                    prompt_bytes=len(ptext.encode())))
+                plist.append({"dir": rel, "claims": group, "model": pm})
+        meta["split"] = {"spec": args.split, "parts": plist,
+                         "parallel": max(1, int(cfg.get("split_parallel", 6)))}
+        print(f"antagonist: split into {len(plist)} parts: "
+              + "; ".join(",".join(p["claims"]) + (f" [{p['model']}]" if args.also_model else "")
+                          for p in plist), file=sys.stderr)
     write_json(os.path.join(run_dir, "meta.json"), meta)
     # opts.json carries the key file *path* (not a secret) so the worker does
     # not depend on the config file staying unchanged between spawn and start.
@@ -1549,11 +2154,15 @@ def cmd_run(args, cfg):
     sys.exit(rc)
 
 
-def worker(run_dir):
+def worker(run_dir, in_thread=False, only_failed=False):
     """Execute one run. Everything is inside the try so any failure lands in
-    meta.json rather than leaving the run `queued`/`running` forever."""
+    meta.json rather than leaving the run `queued`/`running` forever.
+    PRE: in_thread is set for a part of a split run; parts are CLI runs, so
+    the signal-based wall-clock bound (main thread only) is not needed."""
     meta_p = os.path.join(run_dir, "meta.json")
     meta = read_json(meta_p) or {"status": "queued"}
+    if meta.get("split") and not in_thread:
+        return worker_split(run_dir, only_failed=only_failed)
     t0 = time.monotonic()
     secrets = None
     rc = 1
@@ -1565,27 +2174,37 @@ def worker(run_dir):
             raise RuntimeError("opts.json missing or unreadable")
         prompt = open(os.path.join(run_dir, "prompt.md")).read()
         meta.update(status="running", started=now_iso(), worker_pid=os.getpid(),
-                    worker_start=proc_start(os.getpid()))
+                    worker_start=proc_start(os.getpid()), error=None)
         write_json(meta_p, meta)
         opts["_redact"] = secrets.redact
         backend = meta["backend"]
         # API backends: urllib's timeout is per socket operation; the alarm
         # makes --timeout a wall-clock bound. CLI backends bound and kill their
         # child in _run_cli instead.
-        if backend in API_BACKENDS:
+        if backend in API_BACKENDS and not in_thread:
             signal.signal(signal.SIGALRM, _on_alarm)
             signal.alarm(int(opts["timeout"]) + 5)
         try:
             out = BACKENDS[backend](run_dir, prompt, opts)
         finally:
-            signal.alarm(0)
-            for name in ("stdout.log", "stderr.log", "worker.log", "result.raw.md",
-                         "reasoning.md", "cmd.txt", "opts.json"):
-                secrets.redact_file(os.path.join(run_dir, name))
+            if not in_thread:
+                signal.alarm(0)
+            # Every file the backend left in the run dir, the logs of retried
+            # attempts and earlier turns included (subdirectories hold the agy
+            # workspace and the parts, which redact their own files).
+            for name in sorted(os.listdir(run_dir)):
+                path = os.path.join(run_dir, name)
+                if name not in ("meta.json", "launcher.json", "child.pid") and os.path.isfile(path):
+                    secrets.redact_file(path)
         write_text_atomic(os.path.join(run_dir, "result.md"),
                           secrets.redact(out["result_text"]).rstrip() + "\n")
+        extra = dict(out.get("extra") or {})
+        notes = list(extra.get("notes") or [])
+        if looks_truncated(out["result_text"]):
+            notes.append("the answer ends inside a code block: it may be cut short")
+        extra["notes"] = notes
         meta.update(status="done", model_served=out.get("model"), usage=out.get("usage"),
-                    raw_status=out.get("raw_status"), extra=out.get("extra"))
+                    raw_status=out.get("raw_status"), extra=extra)
         rc = 0
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)[:2000]
@@ -1594,8 +2213,77 @@ def worker(run_dir):
         meta.update(status="failed", error=msg)
     finally:
         meta.update(finished=now_iso(), duration_s=round(time.monotonic() - t0, 1))
-        text = json.dumps(meta, indent=2, sort_keys=True)
-        write_text_atomic(meta_p, secrets.redact(text) if secrets else text)
+        write_text_atomic(meta_p, json.dumps(
+            _redact_obj(meta, secrets.redact) if secrets else meta, indent=2, sort_keys=True))
+    return rc
+
+
+def worker_split(run_dir, only_failed=False):
+    """Run the parts of a split run concurrently, then merge.
+    POST: `done` and result.md only when every part is done; otherwise
+    `failed`, with the finished parts merged into result.partial.md."""
+    meta_p = os.path.join(run_dir, "meta.json")
+    meta = read_json(meta_p) or {}
+    t0 = time.monotonic()
+    secrets = None
+    rc = 1
+    try:
+        secrets = Secrets(load_config())
+        parts = meta["split"]["parts"]
+        meta.update(status="running", started=now_iso(), worker_pid=os.getpid(),
+                    worker_start=proc_start(os.getpid()), error=None)
+        write_json(meta_p, meta)
+
+        def part_meta(p):
+            return read_json(os.path.join(run_dir, p["dir"], "meta.json"), {}) or {}
+
+        todo = [p for p in parts if not (only_failed and part_meta(p).get("status") == "done")]
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, int(meta["split"].get("parallel") or 6))) as ex:
+            list(ex.map(lambda p: worker(os.path.join(run_dir, p["dir"]), in_thread=True), todo))
+        metas = [part_meta(p) for p in parts]
+        results = []
+        for p, m in zip(parts, metas):
+            rp = os.path.join(run_dir, p["dir"], "result.md")
+            results.append(open(rp).read() if m.get("status") == "done" and os.path.exists(rp)
+                           else None)
+        usage = {}
+        for m in metas:
+            for k, v in (m.get("usage") or {}).items():
+                if isinstance(v, (int, float)):
+                    usage[k] = usage.get(k, 0) + v
+        meta.update(usage=usage or None,
+                    model_served=", ".join(sorted({str(m["model_served"]) for m in metas
+                                                   if m.get("model_served")})) or None)
+        merged = secrets.redact(merge_parts(parts, metas, results))
+        final, partial = (os.path.join(run_dir, n) for n in ("result.md", "result.partial.md"))
+        for m, text in zip(metas, results):
+            if m.get("status") == "done" and not (text or "").strip():
+                m.update(status="failed", error="recorded done, but its result.md is missing or empty")
+        failed = [(i, m) for i, m in enumerate(metas, 1) if m.get("status") != "done"]
+        if failed:
+            if os.path.exists(final):
+                os.unlink(final)
+            write_text_atomic(partial, merged)
+            raise RuntimeError(
+                f"{len(failed)} of {len(parts)} parts failed ("
+                + "; ".join(f"{i:02d}: {str(m.get('error'))[:160]}" for i, m in failed)
+                + "). Finished parts are in result.partial.md")
+        write_text_atomic(final, merged)
+        if os.path.exists(partial):
+            os.unlink(partial)
+        meta.update(status="done")
+        rc = 0
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)[:2000]
+        meta.update(status="failed", error=secrets.redact(msg) if secrets else msg)
+    finally:
+        if secrets:
+            for name in ("worker.log", "opts.json"):   # the parts redact their own directories
+                secrets.redact_file(os.path.join(run_dir, name))
+        meta.update(finished=now_iso(), duration_s=round(time.monotonic() - t0, 1))
+        write_text_atomic(meta_p, json.dumps(
+            _redact_obj(meta, secrets.redact) if secrets else meta, indent=2, sort_keys=True))
     return rc
 
 
@@ -1649,20 +2337,33 @@ def describe(run_dir, meta):
 
 
 def orphaned_child(run_dir):
-    """pgid of a CLI child group still alive after its worker died, or None."""
-    try:
-        pgid = int(open(os.path.join(run_dir, "child.pid")).read())
-    except (OSError, ValueError):
-        return None
-    return pgid if _group_alive(pgid) else None
+    """pgids of CLI child groups (the run's own or its parts') still alive
+    after the worker died."""
+    alive = []
+    for pid_file in [os.path.join(run_dir, "child.pid")] + sorted(
+            glob.glob(os.path.join(run_dir, "parts", "*", "child.pid"))):
+        try:
+            pgid = int(open(pid_file).read())
+        except (OSError, ValueError):
+            continue
+        if _group_alive(pgid):
+            alive.append(pgid)
+    return alive
 
 
 # Known failure strings and the fix. Matched against the error and the tail
 # of stderr.log; printed by `status` as `hint:`.
 HINTS = [
+    (re.compile(r"sandbox failed to start", re.I),
+     "agy could not start its command sandbox. `antagonist agy-check` tests it and names the "
+     "likely cause (AppArmor user-namespace profile for the agy binary); or rerun with "
+     "--tools read."),
     (re.compile(r"tool was denied", re.I),
-     "agy headless cannot run commands or search tools. Attach search output as evidence (-e) "
-     "and check read grants with `antagonist backends`; or use codex."),
+     "agy refused a tool and the corrective turns did not help. `command`: agy's settings "
+     "need toolPermission = proceed-in-sandbox, or rerun with --tools read. `read_file` "
+     "(read mode): the path is outside --cwd; attach its directory with --read-dir."),
+    (re.compile(r"parts failed", re.I),
+     "`antagonist retry <run>` reruns only the failed parts and merges again."),
     (re.compile(r"exceeded the output token limit", re.I),
      "the answer outgrew agy's output cap. Rerun with --max-words (about 1500) and fewer, "
      "narrower questions; the partial draft in stdout.log is not a result."),
@@ -1704,14 +2405,34 @@ def cmd_status(args, cfg):
         print(f"served:         {secrets.redact(str(meta['model_served']))}")
     if meta.get("usage"):
         print(f"usage:          {json.dumps(meta['usage'])}")
+    extra = meta.get("extra") or {}
+    if extra.get("tool_calls") is not None:
+        print(f"tool calls:     {json.dumps(extra['tool_calls'])}  (mode {extra.get('tools_mode')}, "
+              f"attempts {extra.get('attempts')}, corrective turns {extra.get('corrective_turns')})")
+    if extra.get("denied_actions"):
+        print(f"denied:         {json.dumps(extra['denied_actions'])}")
+    for n in extra.get("notes") or []:
+        print(f"note:           {secrets.redact(str(n))}")
+    for i, part in enumerate((meta.get("split") or {}).get("parts", []), 1):
+        pm = read_json(os.path.join(run_dir, part["dir"], "meta.json"), {}) or {}
+        pst = pm.get("status")
+        if st == "died" and pst in ("queued", "running"):
+            pst = "died"
+        calls = (pm.get("extra") or {}).get("tool_calls")
+        print(f"part {i:02d}:        {pst:<8} claims {','.join(part['claims'])}  "
+              f"{pm.get('model_served') or part.get('model') or ''}  "
+              f"{str(pm.get('duration_s') or '')}s"
+              + (f"  tools {json.dumps(calls)}" if calls else "")
+              + (f"  error: {secrets.redact(str(pm.get('error')))[:200]}" if pm.get("error") else ""))
+        for n in (pm.get("extra") or {}).get("notes") or []:
+            print(f"   note:        {secrets.redact(str(n))}")
     if meta.get("error"):
         print(f"error:          {secrets.redact(meta['error'])}")
         h = hint_for(run_dir, meta["error"])
         if h:
             print(f"hint:           {h}")
     if st == "died":
-        pgid = orphaned_child(run_dir)
-        if pgid:
+        for pgid in orphaned_child(run_dir):
             print(f"orphan:         the CLI child group {pgid} is still running; stop it "
                   f"before rerunning:  kill -TERM -- -{pgid}")
     if st == "running" and meta.get("started"):
@@ -1764,11 +2485,108 @@ def cmd_list(args, cfg):
               f"{secrets.redact(str(meta.get('model_served') or meta.get('model') or ''))}")
 
 
+def cmd_retry(args, cfg):
+    """Rerun the failed parts of a split run and merge again."""
+    run_dir = resolve_run(args.run)
+    meta = read_json(os.path.join(run_dir, "meta.json"), {})
+    if not meta.get("split"):
+        die("retry applies to split runs; rerun a single run with `antagonist run`")
+    st = describe(run_dir, meta)
+    if st in ("queued", "running"):
+        die(f"run is still {st}")
+    if st == "done":
+        die("every part is done; nothing to retry")
+    orphans = orphaned_child(run_dir)
+    if orphans:
+        die("a backend process of this run is still running and would write into the same "
+            "part directory; stop it first:  " + "  ".join(f"kill -TERM -- -{g}" for g in orphans))
+    if args.detach:
+        # meta is rewritten before the worker exists; the worker owns it after.
+        meta.update(status="queued", worker_pid=None, error=None)
+        write_json(os.path.join(run_dir, "meta.json"), meta)
+        log = open(os.path.join(run_dir, "worker.log"), "ab")
+        try:
+            proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", run_dir,
+                                     "--only-failed"], stdin=subprocess.DEVNULL, stdout=log,
+                                    stderr=log, start_new_session=True, close_fds=True)
+        except OSError as exc:
+            meta.update(status="failed", error=f"could not spawn worker: {exc}", finished=now_iso())
+            write_json(os.path.join(run_dir, "meta.json"), meta)
+            die(f"could not spawn worker: {exc}", 1)
+        write_json(os.path.join(run_dir, "launcher.json"),
+                   {"worker_pid": proc.pid, "worker_start": proc_start(proc.pid)})
+        print(run_dir, flush=True)
+        return
+    sys.exit(worker(run_dir, only_failed=True))
+
+
+AGY_CHECK_TOKEN = "antagonist-sandbox-"
+
+
+def cmd_agy_check(args, cfg):
+    """Functional test of the agy recipe: one model call that must run a shell
+    command in agy's sandbox. Run it after agy updates itself.
+    POST: exit 0 only if the command's own output shows it executed."""
+    exe, _ = find_binary("agy")
+    if not exe:
+        die("agy: binary not found on PATH or in fallback dirs", 1)
+    mode, why = agy_tools_mode("auto")
+    print(f"agy binary:     {exe}")
+    print(f"agy settings:   {AGY_SETTINGS}")
+    print(f"tools (auto):   {mode} ({why})")
+    for n in agy_environment(exe):
+        print(f"warning:        {n}")
+    b = cfg["agy"]
+    model = (b.get("model") or "").strip() or None
+    run_dir = new_run_dir("agy", "check")
+    a, c = 6, 7   # the token counts only where a command's own output carries it
+    prompt = (f"Run this shell command exactly once: echo {AGY_CHECK_TOKEN}$(({a}*{c}))\n"
+              "Then reply with its exact output and nothing else. If it was refused or "
+              "failed, quote the error.")
+    write_text_atomic(os.path.join(run_dir, "prompt.md"), prompt)
+    opts = {"cwd": run_dir, "model": model, "effort": norm_effort("agy", b.get("effort"), model),
+            "timeout": 240, "agy_tools": "exec", "agy_web": False, "retries": 0, "read_dirs": []}
+    meta = {"backend": "agy", "model": model, "label": "check", "status": "running",
+            "created_ns": time.time_ns(), "started": now_iso(), "worker_pid": os.getpid(),
+            "worker_start": proc_start(os.getpid())}
+    write_json(os.path.join(run_dir, "meta.json"), meta)
+    ok, err, said = False, None, ""
+    try:
+        said = run_agy(run_dir, prompt, opts)["result_text"]
+        # every turn's log: a corrective turn moves the earlier one to stdout.log.turnN
+        ok = any(name == "run_command" and f"{AGY_CHECK_TOKEN}{a * c}" in out
+                 for log in glob.glob(os.path.join(run_dir, "stdout.log*"))
+                 for name, out in agy_events(run_dir, os.path.basename(log))[1])
+        if not ok:
+            err = "agy answered, but no command output shows the command ran"
+    except RuntimeError as exc:
+        err = str(exc)
+    secrets = Secrets(cfg)
+    for name in sorted(os.listdir(run_dir)):
+        if os.path.isfile(os.path.join(run_dir, name)):
+            secrets.redact_file(os.path.join(run_dir, name))
+    write_text_atomic(os.path.join(run_dir, "result.md"),
+                      f"agy-check: {'PASS' if ok else 'FAIL: ' + secrets.redact(str(err))}\n\n"
+                      + secrets.redact(said).rstrip() + "\n")
+    meta.update(status="done" if ok else "failed", error=err, finished=now_iso())
+    write_json(os.path.join(run_dir, "meta.json"), _redact_obj(meta, secrets.redact))
+    print(f"run dir:        {run_dir}")
+    if ok:
+        print("result:         PASS (a sandboxed command ran)")
+        return
+    print(f"result:         FAIL: {err}")
+    h = hint_for(run_dir, err)
+    if h:
+        print(f"hint:           {h}")
+    sys.exit(1)
+
+
 def cmd_agy_allow(args, cfg):
     """Add a read_file grant for DIR to agy's settings.json (backup first).
+    Runs no longer need it: the review directory is attached per run.
     PRE: agy has no `config set`; the file is the only write path.
     POST: `agy -p /permissions` lists the grant."""
-    path = os.path.join(HOME, ".gemini/antigravity-cli/settings.json")
+    path = AGY_SETTINGS
     if not os.path.exists(path):
         die(f"{path} missing; run agy once interactively first")
     d = read_json(path)
@@ -1814,7 +2632,18 @@ def main(argv=None):
                    help="run even if the prompt matches a credential pattern (known values still refuse)")
     r.add_argument("--quiet", "-q", action="store_true", help="do not print the result")
     r.add_argument("--max-words", type=int, metavar="N",
-                   help="append a word budget to the task (agy has an output cap; ~1500 is safe)")
+                   help="append a word budget to the task (per part under --split)")
+    r.add_argument("--split", metavar="SPEC",
+                   help="one run per group of claims, in parallel, merged into one result: "
+                        "`auto` (3 claims per part), `auto:N`, or groups like `1,2/3,4,7/*` "
+                        "(`*` = every claim not named). CLI backends only")
+    r.add_argument("--also-model", action="append", default=[], metavar="MODEL",
+                   help="with --split: run every part on this model as well (repeatable)")
+    r.add_argument("--tools", choices=["auto", "read", "exec"],
+                   help="agy: read = search and read files; exec = also sandboxed shell "
+                        "(default auto: exec when agy's settings allow it)")
+    r.add_argument("--read-dir", action="append", default=[], metavar="DIR",
+                   help="agy: another directory the reviewer may read (repeatable; --cwd is always readable)")
     r.add_argument("--no-preflight", action="store_true",
                    help="skip the harness/model currency check (also: ANTAGONIST_NO_PREFLIGHT=1)")
     r.add_argument("--refresh", action="store_true", help="refetch the currency check, ignoring the cache")
@@ -1845,13 +2674,22 @@ def main(argv=None):
     l.add_argument("-n", type=int, default=20)
     l.set_defaults(fn=cmd_list)
 
-    a = sub.add_parser("agy-allow", help="grant agy headless read access to a directory")
+    rt = sub.add_parser("retry", help="rerun the failed parts of a split run (default: last)")
+    rt.add_argument("run", nargs="?")
+    rt.add_argument("--detach", "-d", action="store_true")
+    rt.set_defaults(fn=cmd_retry)
+
+    ac = sub.add_parser("agy-check", help="test that agy can run a sandboxed command (one model call)")
+    ac.set_defaults(fn=cmd_agy_check)
+
+    a = sub.add_parser("agy-allow", help="add a standing agy read grant (not needed for runs)")
     a.add_argument("dir")
     a.set_defaults(fn=cmd_agy_allow)
 
     w = sub.add_parser("_worker")
     w.add_argument("run_dir")
-    w.set_defaults(fn=lambda args, cfg: sys.exit(worker(args.run_dir)))
+    w.add_argument("--only-failed", action="store_true")
+    w.set_defaults(fn=lambda args, cfg: sys.exit(worker(args.run_dir, only_failed=args.only_failed)))
 
     args = ap.parse_args(argv)
     cfg = load_config()
