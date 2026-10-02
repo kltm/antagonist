@@ -95,7 +95,11 @@ DEFAULTS = {
     # linger: seconds of stream silence after the answer before the run is ended;
     # stall: seconds of silence with no answer before the attempt is retried (0 = never)
     "agy": {"effort": "high", "model": "gemini-3.1-pro", "tools": "auto", "web": True,
-            "retries": 1, "nudges": 2, "linger": 180, "stall": 600, "quota_pause": 65},
+            "retries": 1, "nudges": 2, "linger": 180, "stall": 600, "quota_pause": 65,
+            # mask: paths hidden from agy (and so from its sandbox) by an outer mount
+            # namespace (bwrap); agy mounts ~/.config and ~/.docker read-only into every
+            # sandbox, credential stores included. [] = no outer namespace.
+            "mask": ["~/.config/gh", "~/.config/gcloud", "~/.config/gws", "~/.docker"]},
     "claude": {"effort": "max", "model": None},
     "anthropic": {
         "effort": "max", "model": "claude-opus-5-5",
@@ -706,6 +710,27 @@ def agy_sandbox_writable(path):
     return None
 
 
+def agy_masked_argv(agy_argv, mask):
+    """Wrap agy in bubblewrap with each existing `mask` path replaced by an
+    empty tmpfs (directory) or /dev/null (file). Root is bound read-write and
+    the network is shared, so agy behaves as before; only the masked paths
+    differ. Returns (argv, masked paths). PRE: nested user namespaces work on
+    the host (agy builds its own sandbox inside); measured 2026-10-02."""
+    paths = [os.path.expanduser(m) for m in mask]
+    present = [m for m in paths if os.path.exists(m)]
+    if not present:
+        return list(agy_argv), []
+    bwrap, _ = find_binary("bwrap")
+    if not bwrap:
+        raise RuntimeError("bwrap (bubblewrap) not found, so these paths cannot be hidden from "
+                           f"agy's sandbox: {', '.join(present)}; install it, or set [agy] mask = [] "
+                           "to accept that a reviewer can read them")
+    argv = [bwrap, "--dev-bind", "/", "/", "--die-with-parent"]
+    for m in present:
+        argv += ["--tmpfs", m] if os.path.isdir(m) else ["--ro-bind", "/dev/null", m]
+    return argv + ["--"] + list(agy_argv), present
+
+
 def agy_environment(exe):
     """Notes on host conditions that stop agy's sandbox. Reads only."""
     notes = []
@@ -998,7 +1023,10 @@ def _run_agy_once(run_dir, prompt, o):
     model, effort = o["model"], o["effort"]
     mode = o.get("agy_tools") or "read"
     ws = agy_workspace(run_dir, mode, bool(o.get("agy_web")))
-    base = ["agy", "-p", "", "--input-format", "stream-json",
+    agy_exe, _ = find_binary("agy")
+    if not agy_exe:
+        raise RuntimeError("agy: binary not found on PATH or in fallback dirs")
+    base = [agy_exe, "-p", "", "--input-format", "stream-json",
             "--output-format", "stream-json", "--sandbox", "--agent", AGY_AGENT,
             "--print-timeout", f"{max(60, o['timeout'])}s"]
     for d in [o["cwd"]] + list(o.get("read_dirs") or []):
@@ -1016,6 +1044,7 @@ def _run_agy_once(run_dir, prompt, o):
         base += ["--model", model]
     nudges = max(0, int(o.get("nudges", 2)))
     linger, stall = float(o.get("linger") or 0), float(o.get("stall") or 0)
+    base, masked = agy_masked_argv(base, o.get("mask") or [])
     text, stdin_name, argv = prompt, "prompt.agy.jsonl", list(base)
     tools, denied_all, turn, notes = [], [], 0, []
     while True:
@@ -1101,7 +1130,7 @@ def _run_agy_once(run_dir, prompt, o):
             "extra": {"conversation_id": result.get("conversation_id"),
                       "num_turns": result.get("num_turns"), "effective_effort": effective,
                       "tools_mode": mode, "tool_calls": counts, "denied_actions": denied_all,
-                      "corrective_turns": turn, "notes": notes}}
+                      "corrective_turns": turn, "notes": notes, "masked": masked}}
 
 
 def run_agy(run_dir, prompt, o):
@@ -2056,7 +2085,8 @@ def cmd_run(args, cfg):
         opts.update(agy_tools=mode, agy_web=bool(b.get("web", True)),
                     retries=int(b.get("retries", 1)), nudges=int(b.get("nudges", 2)),
                     linger=float(b.get("linger", 180)), stall=float(b.get("stall", 600)),
-                    quota_pause=float(b.get("quota_pause", 65)), read_dirs=read_dirs)
+                    quota_pause=float(b.get("quota_pause", 65)), mask=list(b.get("mask") or []),
+                    read_dirs=read_dirs)
         print(f"antagonist: agy tools: {mode} ({why})", file=sys.stderr)
         if mode == "exec":
             for d in [cwd] + read_dirs:
@@ -2567,7 +2597,8 @@ def cmd_agy_check(args, cfg):
               "failed, quote the error.")
     write_text_atomic(os.path.join(run_dir, "prompt.md"), prompt)
     opts = {"cwd": run_dir, "model": model, "effort": norm_effort("agy", b.get("effort"), model),
-            "timeout": 240, "agy_tools": "exec", "agy_web": False, "retries": 0, "read_dirs": []}
+            "timeout": 240, "agy_tools": "exec", "agy_web": False, "retries": 0, "read_dirs": [],
+            "mask": list(b.get("mask") or [])}
     meta = {"backend": "agy", "model": model, "label": "check", "status": "running",
             "created_ns": time.time_ns(), "started": now_iso(), "worker_pid": os.getpid(),
             "worker_start": proc_start(os.getpid())}

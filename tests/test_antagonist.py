@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import secrets as _secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -1177,6 +1178,32 @@ class AgyReviewerTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         rd = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
         self.assertIn(f"under `{under_tmp}` and `{extra}`", self._read(rd, "prompt.md"))
+
+
+    def test_masked_paths_are_hidden_from_agy(self):
+        hidden = tempfile.mkdtemp()
+        open(os.path.join(hidden, "hosts.yml"), "w").write("token-shaped\n")
+        secret_file = os.path.join(tempfile.mkdtemp(), "config.json")
+        open(secret_file, "w").write("{}")
+        # the fake agy reports what it can see at the masked paths
+        self._fake('cat >/dev/null; echo "{\\"event\\":\\"result\\",\\"result\\":{\\"status\\":\\"SUCCESS\\",'
+                   f'\\"response\\":\\"dir=$(ls {hidden} | wc -l) file=$(cat {secret_file} 2>/dev/null | wc -c)\\",\\"usage\\":{{}}}}}}"\n')
+        if not shutil.which("bwrap"):
+            with self.assertRaisesRegex(RuntimeError, "bwrap"):
+                A.run_agy(tempfile.mkdtemp(), "p", self._opts(mask=[hidden, secret_file]))
+            return
+        rd = tempfile.mkdtemp()
+        out = A.run_agy(rd, "p", self._opts(mask=[hidden, secret_file, "/nonexistent/path"]))
+        self.assertEqual(out["result_text"].split(), ["dir=0", "file=0"])
+        self.assertEqual(out["extra"]["masked"], [hidden, secret_file])
+        self.assertIn("--tmpfs " + hidden, self._read(rd, "cmd.txt"))
+        # no mask: agy runs bare and sees the files
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(mask=[]))
+        self.assertEqual(out["result_text"].split(), ["dir=1", "file=2"])
+        self.assertEqual(out["extra"]["masked"], [])
+        # a mask with nothing present wraps nothing
+        out = A.run_agy(tempfile.mkdtemp(), "p", self._opts(mask=["/nonexistent/path"]))
+        self.assertEqual(out["extra"]["masked"], [])
 
 
 class _NoRedact:

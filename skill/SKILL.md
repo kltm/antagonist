@@ -160,12 +160,14 @@ review of 8 to 12 parts takes 10 to 30 (6 parts run at once, and a
 per-minute request quota on the Gemini Enterprise service has failed
 parts under that load, which `retry` reruns).
 
-A reviewer with a shell can read most of what you can, wherever `--cwd`
-points: agy's sandbox hides `~/.ssh`, `~/.aws/credentials` and a few
-like them, not token files that sit in a repository checkout or under
-`~`. What it reads goes to the model's vendor. Use `--tools read` (file
-tools confined to `--cwd` and `--read-dir`) when the review does not need
-execution and the machine holds secrets the vendor should not see.
+A reviewer with a shell reads the review directory, `/tmp`, `~/.cache`,
+the system, and agy's read-only mounts of `~/.config` and `~/.docker`
+less the paths in `[agy] mask` (the runner hides the `gh`, `gcloud`, `gws`
+and docker credential stores by default; `~/.ssh`, `~/.aws`, `~/.netrc`,
+`~/local/share` are absent by agy's design). A token file inside a
+reviewed checkout is readable, and what it reads goes to the model's
+vendor: keep credentials out of checkouts (operations:
+`docs/workstation-credentials.md`).
 
 In `exec` mode the runner refuses a `--cwd` or `--read-dir` under `/tmp`,
 `/var/tmp` or `~/.cache`: the sandbox lets commands write there, so the

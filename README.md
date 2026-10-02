@@ -250,6 +250,17 @@ make. What else `exec` needs on Linux:
 - No `JAVA_HOME`. With it set, the sandbox tries to add its certificate to
   the JVM trust store, finds it read-only and exits. The runner removes
   the variable from agy's environment.
+- An outer mount namespace. agy mounts `~/.config` and `~/.docker`
+  read-only into every sandbox, which exposes `~/.config/gh/hosts.yml`,
+  `~/.config/gcloud/*.db`, `~/.config/gws` and `~/.docker/config.json`
+  to the reviewer (measured 2026-10-02). The runner therefore starts agy
+  inside `bwrap --dev-bind / /` with each path in `[agy] mask` replaced
+  by an empty tmpfs (a directory) or an unreadable `/dev/null` (a file);
+  agy's own sandbox starts inside that namespace unchanged, the network
+  stays shared, and `meta.json` lists what was masked. Without `bwrap`
+  the run refuses unless `mask = []`. `~/.ssh`, `~/.aws`, `~/.netrc`,
+  `~/.claude.json` and `~/local/share` are absent from agy's sandbox by
+  its own design and need no masking.
 
 `antagonist agy-check` runs one sandboxed command through agy and passes
 only if the command's own output shows it ran; run it after agy updates
@@ -346,7 +357,7 @@ Override in the config file.
 
 `~/.config/antagonist/config.toml` (optional; see `config.example.toml`).
 Per-backend `model`, `effort`, `key_file`, `base_url`, `max_tokens`, for
-agy also `tools`, `web`, `retries`, `nudges`, `linger`, `stall` and `quota_pause`, plus top-level `default_backend`,
+agy also `tools`, `web`, `retries`, `nudges`, `linger`, `stall`, `quota_pause` and `mask`, plus top-level `default_backend`,
 `timeout`, `idle_timeout`, `split_parallel`, `preflight_ttl` and
 `preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS`,
 `ANTAGONIST_CACHE` and `ANTAGONIST_AGY_SETTINGS` override the paths. `base_url`
@@ -423,9 +434,10 @@ the sandbox can write, claim parsing, split, merge and part retry.
   restricted, and agy's own sandbox, which changes between releases. agy
   updates itself; `antagonist agy-check` is the test.
 - agy's sandbox is not read-only: commands can write under `/tmp` and
-  cache directories, and can read most files the user can, including
-  credential files that sit in a repository checkout. Its output goes to
-  the model.
+  cache directories, and can read the review directory, `~/.config` and
+  `~/.docker` (less the masked paths), `/tmp`, `~/.cache` and the system.
+  A credential file inside a reviewed checkout is readable; keep them
+  elsewhere. Its output goes to the model.
 - Ending a held-open turn is a judgment from the event stream. A reviewer
   that answers and then waits longer than `linger` for a command, meaning
   to add to its answer, loses the addition.
