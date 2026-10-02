@@ -853,7 +853,7 @@ class AgyReviewerTests(unittest.TestCase):
         marker = os.path.join(self.root, "..", "fail-once-" + os.path.basename(self.root))
         open(marker, "w").close()
         # part "claims 3, 4" fails while the marker exists; each part reports its own scope
-        self._fake('in=$(cat); scope=$(echo "$in" | grep -o "Review ONLY claims [0-9, ]*" | head -1); '
+        self._fake('in=$(cat); scope=$(echo "$in" | grep -o "Report ONLY on claims [0-9, ]*" | head -1); '
                    f'if echo "$scope" | grep -q "3, 4" && [ -e {marker} ]; then exit 1; fi; '
                    'echo "{\\"event\\":\\"result\\",\\"result\\":{\\"status\\":\\"SUCCESS\\",'
                    '\\"response\\":\\"saw: $scope\\",\\"usage\\":{\\"input_tokens\\":5}}}"\n')
@@ -866,15 +866,15 @@ class AgyReviewerTests(unittest.TestCase):
         self.assertIn("1 of 2 parts failed", meta["error"])
         self.assertFalse(os.path.exists(os.path.join(rd, "result.md")))
         partial = self._read(rd, "result.partial.md")
-        self.assertIn("saw: Review ONLY claims 1, 2", partial)
+        self.assertIn("saw: Report ONLY on claims 1, 2", partial)
         self.assertIn("this part failed", partial)
         self.assertEqual(self._run("result", rd).returncode, 1)
         status = self._run("status", rd).stdout
         self.assertIn("part 02:", status)
         self.assertIn("antagonist retry", status)
         # each part got only its own scope, in its own prompt
-        self.assertIn("Review ONLY claims 1, 2.", self._read(rd, "parts", "01", "prompt.md"))
-        self.assertNotIn("Review ONLY", self._read(rd, "prompt.md"))
+        self.assertIn("Report ONLY on claims 1, 2;", self._read(rd, "parts", "01", "prompt.md"))
+        self.assertNotIn("Report ONLY", self._read(rd, "prompt.md"))
         # retry reruns the failed part only
         os.unlink(marker)
         first = os.stat(os.path.join(rd, "parts", "01", "stdout.log")).st_mtime_ns
@@ -883,7 +883,7 @@ class AgyReviewerTests(unittest.TestCase):
         merged = self._run("result", rd)
         self.assertEqual(merged.returncode, 0)
         self.assertIn("# Part 01 of 2: claims 1, 2", merged.stdout)
-        self.assertIn("saw: Review ONLY claims 3, 4", merged.stdout)
+        self.assertIn("saw: Report ONLY on claims 3, 4", merged.stdout)
         self.assertFalse(os.path.exists(os.path.join(rd, "result.partial.md")))
         self.assertEqual(A.read_json(os.path.join(rd, "meta.json"))["usage"], {"input_tokens": 10})
         self.assertEqual(self._run("retry", rd).returncode, 2)   # nothing left to retry
@@ -891,7 +891,6 @@ class AgyReviewerTests(unittest.TestCase):
     def test_split_refusals_and_second_model(self):
         self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
         self.assertIn("no numbered claims", self._run("run", "-b", "agy", "--split", "auto", "-p", "no list").stderr)
-        self.assertIn("CLI backends", self._run("run", "-b", "local", "--model", "m", "--split", "auto", "-p", self.PROMPT).stderr)
         self.assertIn("needs --split", self._run("run", "-b", "agy", "--also-model", "m", "-p", self.PROMPT).stderr)
         self.assertEqual(os.listdir(self.root), [])
         out = self._run("run", "-b", "agy", "--split", "auto:4", "--also-model", "gemini-3.8-flash",
@@ -1091,6 +1090,10 @@ class AgyReviewerTests(unittest.TestCase):
         self.assertEqual(meta["status"], "failed")
         self.assertIn("result.md is missing", meta["error"])
         self.assertFalse(os.path.exists(os.path.join(rd, "result.md")))
+        # the demotion is on disk, so the part is rerun, and the partial table says failed
+        self.assertEqual(A.read_json(os.path.join(rd, "parts", "02", "meta.json"))["status"], "failed")
+        self.assertIn("| failed |", self._read(rd, "result.partial.md"))
+        self.assertEqual(self._run("retry", rd).returncode, 0)
 
     def test_retry_refuses_while_a_backend_process_is_still_running(self):
         self._fake("cat >/dev/null; exit 1\n")
@@ -1122,7 +1125,9 @@ class AgyReviewerTests(unittest.TestCase):
         self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
         under_tmp = tempfile.mkdtemp(dir="/tmp")
         self.assertEqual(A.agy_sandbox_writable(under_tmp), "/tmp")
-        self.assertIsNone(A.agy_sandbox_writable(os.path.expanduser("~")))
+        self.assertEqual(A.agy_sandbox_writable("/"), "/tmp")          # a parent of a writable root
+        self.assertEqual(A.agy_sandbox_writable(os.path.expanduser("~")), os.path.join(os.path.expanduser("~"), ".cache"))
+        self.assertIsNone(A.agy_sandbox_writable(os.path.expanduser("~/local")))
         out = self._run("run", "-b", "agy", "--cwd", under_tmp, "-p", "x")
         self.assertEqual(out.returncode, 2)
         self.assertIn("could change the material", out.stderr)

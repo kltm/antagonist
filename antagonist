@@ -697,7 +697,8 @@ def agy_sandbox_writable(path):
     real = os.path.realpath(path)
     for root in AGY_SANDBOX_WRITABLE:
         r = os.path.realpath(root)
-        if real == r or real.startswith(r + os.sep):
+        common = os.path.commonpath([real, r])
+        if common in (real, r):   # path inside the root, or the root inside the path
             return root
     return None
 
@@ -1935,8 +1936,9 @@ def parse_split(spec, labels):
 def scope_text(group):
     which = ("claim " if len(group) == 1 else "claims ") + ", ".join(group)
     return ("\n# Scope for this pass\n\n"
-            f"This review is split into parts. Review ONLY {which}. Ignore the other claims and "
-            "any question that concerns only them. Split each claim in scope into its separate "
+            f"This review is split into parts. Report ONLY on {which}; the other claims are "
+            "reviewed by other parts and are context here, so a defect that needs one of them "
+            "together with a claim in scope belongs in your report. Split each claim in scope into its separate "
             "clauses, test every clause against the evidence, and give a verdict per clause. "
             "Then list defects in the material relevant to these claims that the claims do not "
             "mention.\n")
@@ -2045,8 +2047,6 @@ def cmd_run(args, cfg):
                 print(f"antagonist: WARNING: {n}", file=sys.stderr)
     groups = None
     if args.split:
-        if backend not in CLI_BACKENDS:
-            die(f"--split is supported for the CLI backends ({', '.join(CLI_BACKENDS)})")
         labels = parse_claims(task)
         if not labels:
             die("--split found no numbered claims: it needs a numbered list under a "
@@ -2247,6 +2247,9 @@ def worker_split(run_dir, only_failed=False):
             rp = os.path.join(run_dir, p["dir"], "result.md")
             results.append(open(rp).read() if m.get("status") == "done" and os.path.exists(rp)
                            else None)
+            if m.get("status") == "done" and not (results[-1] or "").strip():
+                m.update(status="failed", error="recorded done, but its result.md is missing or empty")
+                write_json(os.path.join(run_dir, p["dir"], "meta.json"), m)   # so retry reruns it
         usage = {}
         for m in metas:
             for k, v in (m.get("usage") or {}).items():
@@ -2257,9 +2260,6 @@ def worker_split(run_dir, only_failed=False):
                                                    if m.get("model_served")})) or None)
         merged = secrets.redact(merge_parts(parts, metas, results))
         final, partial = (os.path.join(run_dir, n) for n in ("result.md", "result.partial.md"))
-        for m, text in zip(metas, results):
-            if m.get("status") == "done" and not (text or "").strip():
-                m.update(status="failed", error="recorded done, but its result.md is missing or empty")
         failed = [(i, m) for i, m in enumerate(metas, 1) if m.get("status") != "done"]
         if failed:
             if os.path.exists(final):

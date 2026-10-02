@@ -434,7 +434,13 @@ the sandbox can write, claim parsing, split, merge and part retry.
   separates the two and it is shorter than the answer.
 - `--split` merges by concatenation. Duplicate findings across parts and
   models are left for the reader, and a defect that needs two claims from
-  different groups can be missed.
+  different groups can be missed (each part sees every claim but reports
+  on its own).
+- The cut-short check sees an unclosed code block only; an answer that
+  stops early in prose is not flagged.
+- A per-minute request quota on the Gemini Enterprise service has failed
+  parts of an 8-part run (HTTP 429); the attempt is retried once and
+  `retry` reruns what still failed. The runner does not pace requests.
 - No cost accounting. Usage is recorded where the backend reports it.
 - The preflight compares versions and catalog ids only. It cannot tell
   whether a newer release changed behaviour, whether a newer model is

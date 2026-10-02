@@ -145,18 +145,20 @@ backends can only read what they are given.
 
 | backend | when | default effort |
 |---|---|---|
-| `codex` | the longest single reasoning pass and the longest track record; use it when it is available | `max` (never lower for real reviews) |
-| `agy` | the default when codex is not available, and a second vendor when it is; always with `--split`; a split review finishes in minutes | `high` (its ceiling) |
+| `agy` | the default; always with `--split`, and `--also-model gemini-3.8-flash` for anything with a production surface; a split review takes 10 to 30 minutes | `high` (its ceiling) |
+| `codex` | off the list while its workspace spend cap stands (2026-10-02); when kltm puts it back: the longest single reasoning pass and the longest track record | `max` (never lower for real reviews) |
 | `claude` | cheap fresh-context check; same vendor as this session, weakest independence; can search, not execute | `max` |
 | `anthropic` | API path when the claude login is unavailable | `max` |
 | `moonshot` | third vendor; evidence must be pasted | `max` |
 | `local` | only when a local endpoint is configured | n/a |
 
 For anything with a rollback plan or a production surface, run two
-reviewers on the same prompt and compare: codex and agy when both are
-available, otherwise agy with `--also-model`. Timeout default is 3600 s;
-`max` codex reviews of a few hundred lines have taken 20 to 40 minutes, a
-split agy review about 5 to 10.
+reviewers on the same prompt and compare: agy with `--also-model`, plus a
+second backend when one is available. Timeout default is 3600 s; `max`
+codex reviews of a few hundred lines took 20 to 40 minutes; a split agy
+review of 8 to 12 parts takes 10 to 30 (6 parts run at once, and a
+per-minute request quota on the Gemini Enterprise service has failed
+parts under that load, which `retry` reruns).
 
 A reviewer with a shell can read most of what you can, wherever `--cwd`
 points: agy's sandbox hides `~/.ssh`, `~/.aws/credentials` and a few
@@ -190,7 +192,12 @@ before relaying it:
   `status`): a part whose answer may be cut short, one the runner ended
   because agy held the turn open, one with text set aside in
   `result.trailing.md`. A cut-short part is worth a `retry` only if the
-  missing piece matters.
+  missing piece matters. The cut-short check sees only an unclosed code
+  block; prose that stops early is not flagged, so read the ends.
+- A split review repeats, and can contradict itself across the two
+  models. Nothing merges verdicts: compare the parts on the same claims
+  yourself, and treat a defect that spans two groups as the reader's
+  job, since no part saw both.
 - Report the reviewer's own evidence status (what it verified vs inferred).
 
 Relay in that shape. Do not paste the raw output as the answer.
