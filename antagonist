@@ -851,11 +851,16 @@ class AgyStream:
         return "".join(kept), "".join(trailing)
 
     def answer_complete(self):
-        """An answer of usable length whose longest reply was closed by a DONE event."""
-        texts = [s for s in self.steps if s[1] == "agent_response" and s[2].strip()]
+        """An answer of usable length whose longest reply was closed by a DONE
+        event and was not followed by a tool call: a reply that goes on to run
+        a command (a plan, then a hung command) is work in progress, whatever
+        its length."""
+        texts = [(pos, s) for pos, s in enumerate(self.steps) if s[1] == "agent_response" and s[2].strip()]
         if not texts:
             return False
-        main = max(reversed(texts), key=lambda s: len(s[2]))
+        pos, main = max(reversed(texts), key=lambda t: len(t[1][2]))
+        if any(s[1] == "tool" for s in self.steps[pos + 1:]):
+            return False
         return id(main) in self._done and len(self.answer()[0].strip()) >= AGY_ANSWER_MIN
 
 

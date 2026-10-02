@@ -1087,6 +1087,21 @@ class AgyReviewerTests(unittest.TestCase):
         st = A.AgyStream()
         st.feed(json.dumps(self._step(1, "agent_response", "ACTIVE", "c" * 300)))
         self.assertFalse(st.answer_complete())
+        # a long reply followed by a tool call (a plan, then a command) is not an answer
+        st = A.AgyStream()
+        for e in (self._step(1, "agent_response", "ACTIVE", "plan " * 60), self._step(1, "agent_response"),
+                  self._step(2, "tool", "ACTIVE", tool_info={"name": "run_command"})):
+            st.feed(json.dumps(e))
+        self.assertFalse(st.answer_complete())
+
+    def test_plan_then_hung_command_is_a_stall_not_an_answer(self):
+        old = A.WATCH_POLL
+        A.WATCH_POLL = 0.2
+        self.addCleanup(setattr, A, "WATCH_POLL", old)
+        self._stream([self._step(1, "agent_response", "ACTIVE", "plan " * 60), self._step(1, "agent_response"),
+                      self._step(2, "tool", "ACTIVE", tool_info={"name": "run_command"})], tail="sleep 60")
+        with self.assertRaisesRegex(RuntimeError, "agy went silent"):
+            A.run_agy(tempfile.mkdtemp(), "p", self._opts(linger=1, stall=2, retries=0, timeout=30))
 
     def test_part_recorded_done_without_a_result_fails_the_split_run(self):
         self._fake('cat >/dev/null; echo \'' + RESULT_OK % "ok" + "'\n")
