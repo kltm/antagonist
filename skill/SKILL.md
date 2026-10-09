@@ -1,6 +1,6 @@
 ---
 name: antagonist
-description: Run an independent adversarial review ("the antagonist") of a plan, diff, design, guard script, or claim through a selectable external model backend (codex, agy/Gemini, claude, anthropic API, moonshot, local) via the `antagonist` CLI. Use when kltm asks for an antagonist, adversarial review, second opinion, or independent check; before acting on a multi-step infra plan, a completeness or safety judgment, or a causal account that no single query can refute; before any step that could sever connectivity or is irreversible; and for security-sensitive code even after merge.
+description: Run an independent adversarial review ("the antagonist") of a plan, diff, design, guard script, or claim through a selectable external model backend (codex, agy/Gemini, claude, anthropic API, moonshot, cborg/LBL on-prem, local) via the `antagonist` CLI. Use when kltm asks for an antagonist, adversarial review, second opinion, or independent check; before acting on a multi-step infra plan, a completeness or safety judgment, or a causal account that no single query can refute; before any step that could sever connectivity or is irreversible; and for security-sensitive code even after merge.
 argument-hint: "[backend] <what to review>"
 ---
 
@@ -79,7 +79,7 @@ antagonist run -b agy --effort high -f /path/to/prompt.md \
 ```
 
 Replace every value before showing or running it; pass `--effort`
-explicitly (`max` for codex, claude, anthropic, moonshot; `high` for agy,
+explicitly (`max` for codex, claude, anthropic, moonshot, cborg; `high` for agy,
 its ceiling) so a config default cannot lower it silently. The run prints
 `antagonist: preflight:` notes on stderr when the backend CLI is behind
 its latest release, is off PATH, or the pinned model has a newer sibling
@@ -150,6 +150,7 @@ backends can only read what they are given.
 | `claude` | cheap fresh-context check; same vendor as this session, weakest independence; can search, not execute | `max` |
 | `anthropic` | API path when the claude login is unavailable | `max` |
 | `moonshot` | third vendor; evidence must be pasted | `max` |
+| `cborg` | free fallback: LBL's on-prem `cborg-coder-max` (GLM-5.3 Flash as of 2026-10-09) through the CBORG gateway; evidence must be pasted; a `403 ip_not_authorized` means the 30-day IP entry lapsed (https://computeview.lbl.gov/cborg/overview), not a dead key | `max` |
 | `local` | only when a local endpoint is configured | n/a |
 
 For anything with a rollback plan or a production surface, run two

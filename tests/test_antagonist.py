@@ -152,6 +152,54 @@ class EffortTests(unittest.TestCase):
         self.assertIsNone(A.norm_effort("moonshot", "max", "kimi-k2.6"))
         self.assertEqual(A.norm_effort("codex", "xhigh", None), "xhigh")
         self.assertIsNone(A.norm_effort("local", "max", "m"))
+        self.assertEqual(A.norm_effort("cborg", "medium", "cborg-coder-max"), "high")
+        self.assertEqual(A.norm_effort("cborg", "xhigh", "cborg-coder-max"), "max")
+        self.assertEqual(A.norm_effort("cborg", "low", None), "low")
+        self.assertEqual(A.norm_effort("cborg", "high", None), "high")
+        self.assertEqual(A.norm_effort("cborg", "max", None), "max")
+        self.assertIsNone(A.norm_effort("cborg", None, None))
+
+    def test_split_parallel_for(self):
+        self.assertEqual(A.split_parallel_for("cborg", {"cborg": {"split_parallel": 5}, "split_parallel": 6}), 5)
+        self.assertEqual(A.split_parallel_for("cborg", {"cborg": {"split_parallel": 0}, "split_parallel": 6}), 1)
+        self.assertEqual(A.split_parallel_for("agy", {"agy": {}, "split_parallel": 6}), 6)
+        self.assertEqual(A.split_parallel_for("agy", {}), 6)
+        self.assertEqual(A.split_parallel_for("agy", {"agy": {"split_parallel": "x"}, "split_parallel": 3}), 3)
+
+    def test_key_file_env_style_with_comments(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "x.env")
+        with open(p, "w") as fh:
+            fh.write("# a comment\n\n   \nexport FIRST_TOKEN='abc123'\nexport SECOND=zzz\n")
+        self.assertEqual(A.read_key_file(p), "abc123")
+        with open(p, "w") as fh:
+            fh.write("# only a comment\n")
+        self.assertIsNone(A.read_key_file(p))
+        # a non-assignment line before the assignment is not the key
+        with open(p, "w") as fh:
+            fh.write("set -a\necho loading\nexport FIRST_TOKEN=abc123\n")
+        self.assertEqual(A.read_key_file(p), "abc123")
+        # an empty assignment is no key
+        with open(p, "w") as fh:
+            fh.write("export FIRST_TOKEN=\n")
+        self.assertIsNone(A.read_key_file(p))
+        with open(p, "w") as fh:
+            fh.write("rawtoken\n")
+        self.assertEqual(A.read_key_file(p), "rawtoken")
+
+    def test_probe_key_env_backends(self):
+        cfg = {"cborg": {"key_file": "/nonexistent/cborg.key", "model": "cborg-coder-max"}}
+        os.environ.pop("CBORG_API_KEY", None)
+        ok, note = A.probe("cborg", cfg)
+        self.assertFalse(ok)
+        self.assertIn("CBORG_API_KEY", note)
+        os.environ["CBORG_API_KEY"] = "zzz"
+        try:
+            ok, note = A.probe("cborg", cfg)
+            self.assertTrue(ok)
+            self.assertEqual(note, "$CBORG_API_KEY")
+        finally:
+            del os.environ["CBORG_API_KEY"]
 
     def test_agy_pro_slug(self):
         self.assertEqual(A.AGY_PRO_RE.match("gemini-3.1-pro-low").groups(), ("gemini-3.1-pro", "low"))
@@ -382,6 +430,15 @@ class ApiBackendTests(unittest.TestCase):
         out = A.run_openai_compat(self.run_dir, "p", dict(opts, effort=None, key_file=None), "local")
         self.assertIn("max_tokens", _SSEHandler.seen[-1]["body"])
         self.assertNotIn("reasoning_effort", _SSEHandler.seen[-1]["body"])
+        # cborg: Bearer key, max_tokens (not max_completion_tokens), effort passed
+        _SSEHandler.script = [chunk(reasoning_content="t"), chunk(content="ok"), "data: [DONE]"]
+        out = A.run_openai_compat(self.run_dir, "p", dict(opts, model="cborg-coder-max", effort="max"), "cborg")
+        req = _SSEHandler.seen[-1]
+        self.assertEqual(req["headers"]["authorization"], f"Bearer {SENTINEL}")
+        self.assertIn("max_tokens", req["body"])
+        self.assertNotIn("max_completion_tokens", req["body"])
+        self.assertEqual(req["body"]["reasoning_effort"], "max")
+        self.assertEqual(out["result_text"], "ok")
         # EOF without [DONE] or finish_reason is incomplete
         _SSEHandler.script = [chunk(content="partial")]
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
@@ -1404,6 +1461,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(pre["models"]["agy"], {"error": "RuntimeError", "ids": None})
         self.assertNotIn(TESTKEY, json.dumps(pre))
         self.assertEqual(pre["models"]["moonshot"]["ids"], [{"id": "m"}])
+        self.assertEqual(pre["models"]["cborg"]["ids"], [{"id": "m"}])
         self.assertEqual(pre["harness"]["codex"]["latest"], "1.0.0")
         self.assertEqual(pre["ttl_s"], 3600)    # a fetch with failures is retried within the hour
 

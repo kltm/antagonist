@@ -9,6 +9,7 @@ Backends (selected with --backend):
   claude     Claude Code CLI, `claude -p`, safe mode, plan mode, read-only tools
   anthropic  Anthropic Messages API (raw HTTP), evidence must be pasted
   moonshot   Moonshot/Kimi chat completions API (OpenAI-compatible), pasted
+  cborg      LBL CBORG gateway (OpenAI-compatible), on-prem cborg-coder-max, pasted
   local      any OpenAI-compatible endpoint (ollama, llama.cpp, ...), pasted
 
 INVARIANT: no known credential value (configured key files, secret-looking
@@ -79,7 +80,10 @@ HARNESS = {
 }
 
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-API_BACKENDS = ("anthropic", "moonshot", "local")
+API_BACKENDS = ("anthropic", "moonshot", "cborg", "local")
+# Environment variable consulted when a backend has no readable key_file.
+KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "moonshot": "MOONSHOT_API_KEY",
+           "cborg": "CBORG_API_KEY"}
 CLI_BACKENDS = ("codex", "agy", "claude")
 
 # Built-in defaults; ~/.config/antagonist/config.toml overrides per backend.
@@ -111,6 +115,18 @@ DEFAULTS = {
         "effort": "max", "model": "kimi-k3",
         "key_file": os.path.join(HOME, ".config/antagonist/moonshot.key"),
         "base_url": "https://api.moonshot.ai/v1", "max_tokens": 32768,
+    },
+    # cborg: LBL's gateway. cborg-coder-max is on-prem and unmetered; its
+    # reasoning cannot be disabled and counts against max_tokens, so the
+    # ceiling is generous. CBorg asks for <= 5 parallel requests to on-prem
+    # models, hence the per-backend split_parallel. CAVEAT: the gateway gates
+    # by source IP before auth (self-service entries expire after 30 days);
+    # a 403 ip_not_authorized is an IP problem, not a key problem.
+    "cborg": {
+        "effort": "max", "model": "cborg-coder-max",
+        "key_file": os.path.join(HOME, ".config/antagonist/cborg.key"),
+        "base_url": "https://api.cborg.lbl.gov/v1", "max_tokens": 65536,
+        "split_parallel": 5,
     },
     "local": {
         "effort": None, "model": None, "key_file": None,
@@ -244,16 +260,20 @@ _ASSIGN_RE = re.compile(r"^(?:export\s+)?[A-Z][A-Z0-9_]*=(.*)$")
 
 
 def read_key_file(path):
-    """Accept a raw token, `KEY=value`, or `export KEY=value`. Never echo it."""
+    """Accept a raw token, `KEY=value`, or `export KEY=value`. The first
+    assignment line wins, wherever it sits, so an env file can be named
+    directly; a file with no assignment is a raw token on its first
+    non-blank, non-`#` line (a raw token cannot begin with `#`). Never echo it."""
     if not path or not os.path.exists(path):
         return None
     with open(path) as fh:
-        raw = fh.read().strip()
-    line = raw.splitlines()[0].strip() if raw else ""
-    m = _ASSIGN_RE.match(line)
-    if m:
-        line = m.group(1).strip()
-    return line.strip("'\"") or None
+        raw = fh.read()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    for ln in lines:
+        m = _ASSIGN_RE.match(ln)
+        if m:
+            return m.group(1).strip().strip("'\"") or None
+    return (lines[0].strip("'\"") if lines else "") or None
 
 
 class Secrets:
@@ -393,6 +413,19 @@ def assemble_prompt(task_text, evidence, backend, cwd, preamble=True, note_key=N
     return "\n".join(parts)
 
 
+def split_parallel_for(backend, cfg):
+    """Parts of a --split run in flight at once: the backend section's
+    `split_parallel` when present (an explicit 0 floors to 1), else the global."""
+    b = cfg.get(backend) or {}
+    v = b.get("split_parallel")
+    if v is None:
+        v = cfg.get("split_parallel", 6)
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        return max(1, int(cfg.get("split_parallel", 6)))
+
+
 def norm_effort(backend, effort, model):
     """Map the shared low..max scale onto what each backend accepts."""
     if effort is None:
@@ -410,6 +443,11 @@ def norm_effort(backend, effort, model):
             return {"low": "low", "medium": "high", "high": "high",
                     "xhigh": "max", "max": "max"}[effort]
         return None
+    if backend == "cborg":
+        # GLM-5.3 Flash behind cborg-coder-max documents low|high|max; the
+        # gateway accepts other words but their meaning is undocumented.
+        return {"low": "low", "medium": "high", "high": "high",
+                "xhigh": "max", "max": "max"}[effort]
     return None
 
 
@@ -1348,10 +1386,10 @@ def _write_api_cmd(run_dir, url, body, header_note):
 
 def run_openai_compat(run_dir, prompt, o, provider):
     key = read_key_file(o["key_file"]) if o.get("key_file") else None
-    if provider == "moonshot" and not key:
-        key = os.environ.get("MOONSHOT_API_KEY")
+    if provider in KEY_ENV and not key:
+        key = os.environ.get(KEY_ENV[provider])
         if not key:
-            raise RuntimeError("no API key: set key_file in config or MOONSHOT_API_KEY")
+            raise RuntimeError(f"no API key: set key_file in config or {KEY_ENV[provider]}")
     model = (o["model"] or "").strip()
     if not model:
         raise RuntimeError(f"{provider}: --model is required (no default)")
@@ -1409,6 +1447,7 @@ BACKENDS = {
     "claude": run_claude,
     "anthropic": run_anthropic,
     "moonshot": lambda r, p, o: run_openai_compat(r, p, o, "moonshot"),
+    "cborg": lambda r, p, o: run_openai_compat(r, p, o, "cborg"),
     "local": lambda r, p, o: run_openai_compat(r, p, o, "local"),
 }
 
@@ -1432,9 +1471,9 @@ def probe(backend, cfg, model=None):
             if mode == "exec":
                 note += "".join(f"; WARNING: {n}" for n in agy_environment(exe))
         return True, note
-    if backend in ("anthropic", "moonshot"):
+    if backend in KEY_ENV:
         kf = b.get("key_file")
-        env = {"anthropic": "ANTHROPIC_API_KEY", "moonshot": "MOONSHOT_API_KEY"}[backend]
+        env = KEY_ENV[backend]
         if kf and os.path.exists(kf):
             return True, f"key file {kf}"
         if os.environ.get(env):
@@ -1629,7 +1668,7 @@ def github_latest(repo):
 
 
 def api_key_for(backend, cfg):
-    env = {"anthropic": "ANTHROPIC_API_KEY", "moonshot": "MOONSHOT_API_KEY"}.get(backend)
+    env = KEY_ENV.get(backend)
     return read_key_file(cfg[backend].get("key_file")) or (os.environ.get(env) if env else None)
 
 
@@ -1713,6 +1752,7 @@ def fetch_preflight(cfg, deadline=None):
     jobs = {("harness", n): (lambda n=n, src=src: _harness_job(n, src)) for n, src in HARNESS.items()}
     jobs.update({("models", "anthropic"): lambda: {"ids": catalog_anthropic(cfg)},
                  ("models", "moonshot"): lambda: {"ids": catalog_openai_compat("moonshot", cfg)},
+                 ("models", "cborg"): lambda: {"ids": catalog_openai_compat("cborg", cfg)},
                  ("models", "local"): lambda: {"ids": catalog_openai_compat("local", cfg)},
                  ("models", "agy"): lambda: {"ids": catalog_agy()}})
     results = {}
@@ -2172,7 +2212,7 @@ def cmd_run(args, cfg):
                     prompt_bytes=len(ptext.encode())))
                 plist.append({"dir": rel, "claims": group, "model": pm})
         meta["split"] = {"spec": args.split, "parts": plist,
-                         "parallel": max(1, int(cfg.get("split_parallel", 6)))}
+                         "parallel": split_parallel_for(backend, cfg)}
         print(f"antagonist: split into {len(plist)} parts: "
               + "; ".join(",".join(p["claims"]) + (f" [{p['model']}]" if args.also_model else "")
                           for p in plist), file=sys.stderr)

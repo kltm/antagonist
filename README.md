@@ -188,10 +188,12 @@ verify-then-relay rule.
 | `claude` | `claude -p --output-format json --permission-mode plan --tools Read,Grep,Glob --no-session-persistence --safe-mode --strict-mcp-config --disable-slash-commands --effort <e>`; prompt on stdin | yes, read-only tools; no `CLAUDE.md`, hooks, MCP, skills | low, medium, high, xhigh, max | max |
 | `anthropic` | `POST /v1/messages`, streaming, adaptive thinking, `output_config.effort`, server-side refusal fallbacks | no | low, medium, high, xhigh, max | max, `claude-opus-5-5` |
 | `moonshot` | `POST /v1/chat/completions` (OpenAI-compatible), streaming, `reasoning_effort` on kimi-k3 | no | low, high, max | max, `kimi-k3` |
+| `cborg` | same against LBL's CBORG gateway (`https://api.cborg.lbl.gov/v1`); `cborg-coder-max` is on-prem and unmetered, its reasoning is always on and counts against `max_tokens` | no | low, high, max | max, `cborg-coder-max` |
 | `local` | same as moonshot against `base_url` (default ollama) | no | ignored | model required |
 
 `--effort` takes the shared scale and is mapped per backend (`xhigh` and
-`max` become `high` on agy; `medium` becomes `high` on kimi-k3, which has no medium).
+`max` become `high` on agy; `medium` becomes `high` and `xhigh` becomes `max`
+on kimi-k3 and cborg-coder-max, which have no medium).
 
 The literal command for every CLI run is written to `cmd.txt` in the run
 directory. For API runs `cmd.txt` holds the endpoint and the request body
@@ -323,9 +325,11 @@ fallback block arrives the served model is taken from it and
 the run with the category. `max_tokens` and `model_context_window_exceeded`
 stops are marked in the result. Default `max_tokens` is 64000.
 
-**moonshot / local.** OpenAI-compatible chat completions. Moonshot gets
-`max_completion_tokens` and, for kimi-k3 only, `reasoning_effort`; local
-gets `max_tokens`. `stream_options.include_usage` asks for a final usage
+**moonshot / cborg / local.** OpenAI-compatible chat completions. Moonshot gets
+`max_completion_tokens` and, for kimi-k3 only, `reasoning_effort`; cborg and local
+get `max_tokens`, cborg also `reasoning_effort`. CAVEAT (cborg): the gateway
+gates by source IP before auth, and self-service IP entries expire after 30
+days, so a `403 ip_not_authorized` is an IP problem, not a key problem. `stream_options.include_usage` asks for a final usage
 chunk; providers that ignore it leave `usage` null. Streamed
 `reasoning_content` is saved to `reasoning.md`.
 
@@ -347,9 +351,13 @@ Defaults:
 
 - anthropic: `~/.config/antagonist/anthropic.key` or `$ANTHROPIC_API_KEY`
 - moonshot: `~/.config/antagonist/moonshot.key` or `$MOONSHOT_API_KEY`
+- cborg: `~/.config/antagonist/cborg.key` or `$CBORG_API_KEY`
 
 Keys kept elsewhere need only a `key_file` line per backend in the
-config file; the defaults above are a convention, not a requirement.
+config file; the defaults above are a convention, not a requirement. A key
+file holds a raw token, `KEY=value`, or `export KEY=value`; blank and `#`
+lines before the first assignment are skipped, so an existing env file can
+be named directly (the first assignment in it is taken as the key).
 
 Override in the config file.
 
@@ -362,8 +370,10 @@ agy also `tools`, `web`, `retries`, `nudges`, `linger`, `stall`, `quota_pause` a
 `preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS`,
 `ANTAGONIST_CACHE` and `ANTAGONIST_AGY_SETTINGS` override the paths. `base_url`
 shapes differ by API: anthropic takes the host (`/v1/messages` is
-appended; a trailing `/v1` is stripped), moonshot and local take the
-OpenAI-style root including `/v1` (`/chat/completions` is appended).
+appended; a trailing `/v1` is stripped), moonshot, cborg and local take the
+OpenAI-style root including `/v1` (`/chat/completions` is appended). A
+backend section may set its own `split_parallel` (cborg defaults to 5, the
+ceiling CBorg asks for on its on-prem models).
 
 ## Run directory
 
