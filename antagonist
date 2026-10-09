@@ -121,7 +121,8 @@ DEFAULTS = {
     # ceiling is generous. CBorg asks for <= 5 parallel requests to on-prem
     # models, hence the per-backend split_parallel. CAVEAT: the gateway gates
     # by source IP before auth (self-service entries expire after 30 days);
-    # a 403 ip_not_authorized is an IP problem, not a key problem.
+    # a 403 ip_not_authorized is an IP problem, not a key problem (a bad key
+    # is a 401).
     "cborg": {
         "effort": "max", "model": "cborg-coder-max",
         "key_file": os.path.join(HOME, ".config/antagonist/cborg.key"),
@@ -256,24 +257,43 @@ def load_config():
 
 # Only an UPPER_CASE shell identifier counts as an assignment; a bare token
 # such as `abc=def==` is kept whole.
-_ASSIGN_RE = re.compile(r"^(?:export\s+)?[A-Z][A-Z0-9_]*=(.*)$")
+# An assignment is `export name=...` (any case) or `NAME=...` (uppercase
+# only): a raw token may itself contain `=` (`abc=def==`), and only the
+# uppercase convention distinguishes it from a lowercase assignment.
+_ASSIGN_RE = re.compile(r"^(?:export\s+([A-Za-z_][A-Za-z0-9_]*)|([A-Z][A-Z0-9_]*))=(.*)$")
+_KEYISH_RE = re.compile(r"(TOKEN|KEY|SECRET)$", re.I)
+
+
+def _shell_value(raw):
+    """The value of `NAME=raw` as a shell would read it, for the simple
+    cases a key file uses: a quoted string (to the closing quote; a `#`
+    after it is a comment), or an unquoted word ending at whitespace (so a
+    trailing ` # comment` is dropped). No expansion."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        q = raw[0]
+        end = raw.find(q, 1)
+        return raw[1:end] if end > 0 else raw[1:]
+    return raw.split(None, 1)[0] if raw else ""
 
 
 def read_key_file(path):
-    """Accept a raw token, `KEY=value`, or `export KEY=value`. The first
-    assignment line wins, wherever it sits, so an env file can be named
-    directly; a file with no assignment is a raw token on its first
-    non-blank, non-`#` line (a raw token cannot begin with `#`). Never echo it."""
+    """Accept a raw token, `KEY=value`, or `export KEY=value`, so an env file
+    can be named directly. Among assignment lines, one whose name ends in
+    TOKEN, KEY or SECRET wins; otherwise the first assignment. Values are
+    read as a shell would (quotes, trailing `# comment` dropped). A file with
+    no assignment is a raw token on its first non-blank, non-`#` line (a raw
+    token cannot begin with `#`). Never echo it."""
     if not path or not os.path.exists(path):
         return None
     with open(path) as fh:
         raw = fh.read()
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    for ln in lines:
-        m = _ASSIGN_RE.match(ln)
-        if m:
-            return m.group(1).strip().strip("'\"") or None
-    return (lines[0].strip("'\"") if lines else "") or None
+    assigns = [(m.group(1) or m.group(2), _shell_value(m.group(3))) for m in map(_ASSIGN_RE.match, lines) if m]
+    if assigns:
+        keyish = [v for n, v in assigns if _KEYISH_RE.search(n)]
+        return (keyish[0] if keyish else assigns[0][1]) or None
+    return (_shell_value(lines[0]) if lines else "") or None
 
 
 class Secrets:
@@ -420,10 +440,12 @@ def split_parallel_for(backend, cfg):
     v = b.get("split_parallel")
     if v is None:
         v = cfg.get("split_parallel", 6)
-    try:
-        return max(1, int(v))
-    except (TypeError, ValueError):
-        return max(1, int(cfg.get("split_parallel", 6)))
+    for cand in (v, cfg.get("split_parallel", 6), 6):
+        try:
+            return max(1, int(cand))
+        except (TypeError, ValueError):
+            continue
+    return 6
 
 
 def norm_effort(backend, effort, model):
@@ -444,10 +466,13 @@ def norm_effort(backend, effort, model):
                     "xhigh": "max", "max": "max"}[effort]
         return None
     if backend == "cborg":
-        # GLM-5.3 Flash behind cborg-coder-max documents low|high|max; the
-        # gateway accepts other words but their meaning is undocumented.
-        return {"low": "low", "medium": "high", "high": "high",
-                "xhigh": "max", "max": "max"}[effort]
+        if model and re.match(r"^cborg-coder-max(?:$|-)", model):
+            # GLM-5.3 Flash behind cborg-coder-max documents low|high|max; the
+            # gateway accepts other words but their meaning is undocumented.
+            # Other models through the gateway get no reasoning_effort at all.
+            return {"low": "low", "medium": "high", "high": "high",
+                    "xhigh": "max", "max": "max"}[effort]
+        return None
     return None
 
 
@@ -1422,9 +1447,17 @@ def run_openai_compat(run_dir, prompt, o, provider):
             if ch.get("finish_reason"):
                 st["finish"] = ch["finish_reason"]
 
-    done = _sse_post(f"{o['base_url'].rstrip('/')}/chat/completions", headers, body,
-                     o["idle_timeout"], os.path.join(run_dir, "stdout.log"), on_event,
-                     redact=o.get("_redact", lambda s: s))
+    try:
+        done = _sse_post(f"{o['base_url'].rstrip('/')}/chat/completions", headers, body,
+                         o["idle_timeout"], os.path.join(run_dir, "stdout.log"), on_event,
+                         redact=o.get("_redact", lambda s: s))
+    except RuntimeError as exc:
+        if provider == "cborg" and "ip_not_authorized" in str(exc):
+            raise RuntimeError("CBORG refused this source IP before checking the key "
+                               "(self-service IP entries expire after 30 days: "
+                               "https://computeview.lbl.gov/cborg/overview): "
+                               f"{exc}") from exc
+        raise
     if reasoning:
         with open(os.path.join(run_dir, "reasoning.md"), "w") as fh:
             fh.write("".join(reasoning))

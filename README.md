@@ -355,9 +355,11 @@ Defaults:
 
 Keys kept elsewhere need only a `key_file` line per backend in the
 config file; the defaults above are a convention, not a requirement. A key
-file holds a raw token, `KEY=value`, or `export KEY=value`; blank and `#`
-lines before the first assignment are skipped, so an existing env file can
-be named directly (the first assignment in it is taken as the key).
+file holds a raw token, `KEY=value`, or `export KEY=value`, so an existing
+env file can be named directly: among its assignments, one whose name ends
+in `TOKEN`, `KEY` or `SECRET` is taken as the key, else the first; values
+are read as a shell would (quotes honoured, a trailing `# comment`
+dropped); `#` lines and blank lines are ignored.
 
 Override in the config file.
 

@@ -154,10 +154,12 @@ class EffortTests(unittest.TestCase):
         self.assertIsNone(A.norm_effort("local", "max", "m"))
         self.assertEqual(A.norm_effort("cborg", "medium", "cborg-coder-max"), "high")
         self.assertEqual(A.norm_effort("cborg", "xhigh", "cborg-coder-max"), "max")
-        self.assertEqual(A.norm_effort("cborg", "low", None), "low")
-        self.assertEqual(A.norm_effort("cborg", "high", None), "high")
-        self.assertEqual(A.norm_effort("cborg", "max", None), "max")
-        self.assertIsNone(A.norm_effort("cborg", None, None))
+        self.assertEqual(A.norm_effort("cborg", "high", "cborg-coder-max"), "high")
+        self.assertEqual(A.norm_effort("cborg", "max", "cborg-coder-max"), "max")
+        self.assertEqual(A.norm_effort("cborg", "low", "cborg-coder-max-compact"), "low")
+        self.assertIsNone(A.norm_effort("cborg", "max", "claude-opus-5-5"))
+        self.assertIsNone(A.norm_effort("cborg", "max", None))
+        self.assertIsNone(A.norm_effort("cborg", None, "cborg-coder-max"))
 
     def test_split_parallel_for(self):
         self.assertEqual(A.split_parallel_for("cborg", {"cborg": {"split_parallel": 5}, "split_parallel": 6}), 5)
@@ -165,6 +167,7 @@ class EffortTests(unittest.TestCase):
         self.assertEqual(A.split_parallel_for("agy", {"agy": {}, "split_parallel": 6}), 6)
         self.assertEqual(A.split_parallel_for("agy", {}), 6)
         self.assertEqual(A.split_parallel_for("agy", {"agy": {"split_parallel": "x"}, "split_parallel": 3}), 3)
+        self.assertEqual(A.split_parallel_for("agy", {"agy": {"split_parallel": "x"}, "split_parallel": "y"}), 6)
 
     def test_key_file_env_style_with_comments(self):
         d = tempfile.mkdtemp()
@@ -183,6 +186,21 @@ class EffortTests(unittest.TestCase):
         with open(p, "w") as fh:
             fh.write("export FIRST_TOKEN=\n")
         self.assertIsNone(A.read_key_file(p))
+        # inline trailing comments and quotes are read as a shell would
+        with open(p, "w") as fh:
+            fh.write("export A_TOKEN=abc123 # rotated 2026-10\n")
+        self.assertEqual(A.read_key_file(p), "abc123")
+        with open(p, "w") as fh:
+            fh.write('export A_TOKEN="abc 123" # note\n')
+        self.assertEqual(A.read_key_file(p), "abc 123")
+        # a key-like name wins over an earlier assignment
+        with open(p, "w") as fh:
+            fh.write("export BASE_URL=https://x.example/v1\nexport MY_API_KEY=k9\nexport OTHER=zz\n")
+        self.assertEqual(A.read_key_file(p), "k9")
+        # a lowercase assignment is an assignment, not a raw token
+        with open(p, "w") as fh:
+            fh.write("export cborg_api_key=lower1\n")
+        self.assertEqual(A.read_key_file(p), "lower1")
         with open(p, "w") as fh:
             fh.write("rawtoken\n")
         self.assertEqual(A.read_key_file(p), "rawtoken")
@@ -439,6 +457,20 @@ class ApiBackendTests(unittest.TestCase):
         self.assertNotIn("max_completion_tokens", req["body"])
         self.assertEqual(req["body"]["reasoning_effort"], "max")
         self.assertEqual(out["result_text"], "ok")
+        # budget consumed by reasoning alone: finish=length, no content -> failure
+        _SSEHandler.script = [chunk(reasoning_content="think" * 3),
+                              ("", {"id": "x", "model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+                              "data: [DONE]"]
+        with self.assertRaisesRegex(RuntimeError, "no visible text"):
+            A.run_openai_compat(self.run_dir, "p", dict(opts, model="cborg-coder-max"), "cborg")
+        # partial content cut by the budget: reported, with the truncation marker
+        _SSEHandler.script = [chunk(reasoning_content="t"), chunk(content="partial answ"),
+                              ("", {"id": "x", "model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+                              "data: [DONE]"]
+        out = A.run_openai_compat(self.run_dir, "p", dict(opts, model="cborg-coder-max"), "cborg")
+        self.assertTrue(out["result_text"].startswith("partial answ"))
+        self.assertIn("truncated at max tokens", out["result_text"])
+        self.assertEqual(out["raw_status"], "length")
         # EOF without [DONE] or finish_reason is incomplete
         _SSEHandler.script = [chunk(content="partial")]
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
