@@ -160,6 +160,12 @@ class EffortTests(unittest.TestCase):
         self.assertIsNone(A.norm_effort("cborg", "max", "claude-opus-5-5"))
         self.assertIsNone(A.norm_effort("cborg", "max", None))
         self.assertIsNone(A.norm_effort("cborg", None, "cborg-coder-max"))
+        self.assertEqual(A.norm_effort("reflection", "xhigh", "Beam-1.0-501B-A23B"), "xhigh")
+        self.assertEqual(A.norm_effort("reflection", "medium", "Beam-1.0-501B-A23B"), "medium")
+        self.assertEqual(A.norm_effort("reflection", "max", "beam-2-test"), "max")
+        self.assertIsNone(A.norm_effort("reflection", "max", "other-model"))
+        self.assertIsNone(A.norm_effort("reflection", "max", None))
+        self.assertIsNone(A.norm_effort("reflection", None, "Beam-1.0-501B-A23B"))
 
     def test_split_parallel_for(self):
         self.assertEqual(A.split_parallel_for("cborg", {"cborg": {"split_parallel": 5}, "split_parallel": 6}), 5)
@@ -457,6 +463,19 @@ class ApiBackendTests(unittest.TestCase):
         self.assertNotIn("max_completion_tokens", req["body"])
         self.assertEqual(req["body"]["reasoning_effort"], "max")
         self.assertEqual(out["result_text"], "ok")
+        # reflection: Bearer key, max_tokens, the full effort scale passed through
+        _SSEHandler.script = [chunk(reasoning_content="t"), chunk(content="ok"), "data: [DONE]"]
+        out = A.run_openai_compat(self.run_dir, "p", dict(opts, model="Beam-1.0-501B-A23B", effort="xhigh"), "reflection")
+        req = _SSEHandler.seen[-1]
+        self.assertEqual(req["headers"]["authorization"], f"Bearer {SENTINEL}")
+        self.assertIn("max_tokens", req["body"])
+        self.assertNotIn("max_completion_tokens", req["body"])
+        self.assertEqual(req["body"]["reasoning_effort"], "xhigh")
+        self.assertEqual(out["result_text"], "ok")
+        # reflection: the beta allowance error is explained
+        _SSEHandler.script = [("", {"error": {"type": "rate_limit_error", "code": "daily_allowance_exhausted"}})]
+        with self.assertRaisesRegex(RuntimeError, "daily allowance"):
+            A.run_openai_compat(self.run_dir, "p", dict(opts, model="Beam-1.0-501B-A23B"), "reflection")
         # budget consumed by reasoning alone: finish=length, no content -> failure
         _SSEHandler.script = [chunk(reasoning_content="think" * 3),
                               ("", {"id": "x", "model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
@@ -1494,6 +1513,7 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn(TESTKEY, json.dumps(pre))
         self.assertEqual(pre["models"]["moonshot"]["ids"], [{"id": "m"}])
         self.assertEqual(pre["models"]["cborg"]["ids"], [{"id": "m"}])
+        self.assertEqual(pre["models"]["reflection"]["ids"], [{"id": "m"}])
         self.assertEqual(pre["harness"]["codex"]["latest"], "1.0.0")
         self.assertEqual(pre["ttl_s"], 3600)    # a fetch with failures is retried within the hour
 

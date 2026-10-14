@@ -10,6 +10,7 @@ Backends (selected with --backend):
   anthropic  Anthropic Messages API (raw HTTP), evidence must be pasted
   moonshot   Moonshot/Kimi chat completions API (OpenAI-compatible), pasted
   cborg      LBL CBORG gateway (OpenAI-compatible), on-prem cborg-coder-max, pasted
+  reflection Reflection AI (OpenAI-compatible), Beam-1.0-501B-A23B, pasted
   local      any OpenAI-compatible endpoint (ollama, llama.cpp, ...), pasted
 
 INVARIANT: no known credential value (configured key files, secret-looking
@@ -80,10 +81,10 @@ HARNESS = {
 }
 
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-API_BACKENDS = ("anthropic", "moonshot", "cborg", "local")
+API_BACKENDS = ("anthropic", "moonshot", "cborg", "reflection", "local")
 # Environment variable consulted when a backend has no readable key_file.
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "moonshot": "MOONSHOT_API_KEY",
-           "cborg": "CBORG_API_KEY"}
+           "cborg": "CBORG_API_KEY", "reflection": "REFLECTION_API_KEY"}
 CLI_BACKENDS = ("codex", "agy", "claude")
 
 # Built-in defaults; ~/.config/antagonist/config.toml overrides per backend.
@@ -128,6 +129,16 @@ DEFAULTS = {
         "key_file": os.path.join(HOME, ".config/antagonist/cborg.key"),
         "base_url": "https://api.cborg.lbl.gov/v1", "max_tokens": 65536,
         "split_parallel": 5,
+    },
+    # reflection: Reflection AI's developer platform, Beam-1.0-501B-A23B
+    # (open beta as of 2026-10-14). Reasoning is mandatory, defaults to max
+    # on the server, counts against max_tokens, and draws on a free daily
+    # allowance of 100k output tokens shared by the whole org (renews 00:00
+    # UTC), so the default effort is high, not max. Full low..max scale.
+    "reflection": {
+        "effort": "high", "model": "Beam-1.0-501B-A23B",
+        "key_file": os.path.join(HOME, ".config/antagonist/reflection.key"),
+        "base_url": "https://api.reflection.ai/openai/v1", "max_tokens": 65536,
     },
     "local": {
         "effort": None, "model": None, "key_file": None,
@@ -472,6 +483,12 @@ def norm_effort(backend, effort, model):
             # Other models through the gateway get no reasoning_effort at all.
             return {"low": "low", "medium": "high", "high": "high",
                     "xhigh": "max", "max": "max"}[effort]
+        return None
+    if backend == "reflection":
+        # Beam documents the full scale (low|medium|high|xhigh|max); other
+        # models on the endpoint get no reasoning_effort.
+        if model and re.match(r"^beam-", model, re.I):
+            return effort
         return None
     return None
 
@@ -1452,6 +1469,14 @@ def run_openai_compat(run_dir, prompt, o, provider):
                          o["idle_timeout"], os.path.join(run_dir, "stdout.log"), on_event,
                          redact=o.get("_redact", lambda s: s))
     except RuntimeError as exc:
+        if provider == "reflection":
+            s = str(exc)
+            if "daily_allowance_exhausted" in s:
+                raise RuntimeError("Reflection's free daily allowance is used up; it renews "
+                                   f"at 00:00 UTC (rerun then, or at a lower --effort): {s}") from exc
+            if "insufficient_credits" in s or "prepaid_balance_exhausted" in s:
+                raise RuntimeError("Reflection's prepaid balance is empty "
+                                   f"(https://platform.reflection.ai/billing): {s}") from exc
         if provider == "cborg" and "ip_not_authorized" in str(exc):
             raise RuntimeError("CBORG refused this source IP before checking the key "
                                "(self-service IP entries expire after 30 days: "
@@ -1481,6 +1506,7 @@ BACKENDS = {
     "anthropic": run_anthropic,
     "moonshot": lambda r, p, o: run_openai_compat(r, p, o, "moonshot"),
     "cborg": lambda r, p, o: run_openai_compat(r, p, o, "cborg"),
+    "reflection": lambda r, p, o: run_openai_compat(r, p, o, "reflection"),
     "local": lambda r, p, o: run_openai_compat(r, p, o, "local"),
 }
 
@@ -1786,6 +1812,7 @@ def fetch_preflight(cfg, deadline=None):
     jobs.update({("models", "anthropic"): lambda: {"ids": catalog_anthropic(cfg)},
                  ("models", "moonshot"): lambda: {"ids": catalog_openai_compat("moonshot", cfg)},
                  ("models", "cborg"): lambda: {"ids": catalog_openai_compat("cborg", cfg)},
+                 ("models", "reflection"): lambda: {"ids": catalog_openai_compat("reflection", cfg)},
                  ("models", "local"): lambda: {"ids": catalog_openai_compat("local", cfg)},
                  ("models", "agy"): lambda: {"ids": catalog_agy()}})
     results = {}
@@ -2497,6 +2524,13 @@ HINTS = [
      "owner's side (no attack/bypass wording) and rerun."),
     (re.compile(r"binary not found", re.I),
      "the backend CLI is not on PATH or in the fallback directories; `antagonist backends`."),
+    (re.compile(r"daily_allowance_exhausted", re.I),
+     "Reflection's free daily allowance (100k output tokens, reasoning included, org-wide) "
+     "is used up; it renews at 00:00 UTC. Rerun then, at a lower --effort, or on another "
+     "backend."),
+    (re.compile(r"insufficient_credits|prepaid_balance_exhausted", re.I),
+     "Reflection's prepaid balance is empty: top up at https://platform.reflection.ai/billing "
+     "(a manual purchase; nothing recharges on its own)."),
     (re.compile(r"went silent|incomplete", re.I),
      "the stream stalled or ended early. Rerun; at `high` rather than `max` for a "
      "long-reasoning API model."),

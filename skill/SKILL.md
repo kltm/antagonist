@@ -80,7 +80,7 @@ antagonist run -b agy --effort high -f /path/to/prompt.md \
 
 Replace every value before showing or running it; pass `--effort`
 explicitly (`max` for codex, claude, anthropic, moonshot, cborg; `high` for agy,
-its ceiling) so a config default cannot lower it silently. The run prints
+its ceiling, and for reflection, whose free daily allowance is small) so a config default cannot lower it silently. The run prints
 `antagonist: preflight:` notes on stderr when the backend CLI is behind
 its latest release, is off PATH, or the pinned model has a newer sibling
 in its family; relay any note to kltm in the check-in or the result
@@ -151,6 +151,7 @@ backends can only read what they are given.
 | `anthropic` | API path when the claude login is unavailable | `max` |
 | `moonshot` | third vendor; evidence must be pasted | `max` |
 | `cborg` | free fallback: LBL's on-prem `cborg-coder-max` (GLM-5.3 Flash as of 2026-10-09) through the CBORG gateway; evidence must be pasted; a `403 ip_not_authorized` means the 30-day IP entry lapsed (https://computeview.lbl.gov/cborg/overview), not a dead key | `max` |
+| `reflection` | Reflection AI's `Beam-1.0-501B-A23B` (open beta since 2026-10-14; the org shares a free daily allowance of 100k output tokens, reasoning included, renewing at 00:00 UTC); evidence must be pasted; the runner reads the work key under `go/env/`; a `daily_allowance_exhausted` 429 means wait or switch backend | `high` (`max` only for one short review) |
 | `local` | only when a local endpoint is configured | n/a |
 
 For anything with a rollback plan or a production surface, run two

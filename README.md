@@ -189,11 +189,12 @@ verify-then-relay rule.
 | `anthropic` | `POST /v1/messages`, streaming, adaptive thinking, `output_config.effort`, server-side refusal fallbacks | no | low, medium, high, xhigh, max | max, `claude-opus-5-5` |
 | `moonshot` | `POST /v1/chat/completions` (OpenAI-compatible), streaming, `reasoning_effort` on kimi-k3 | no | low, high, max | max, `kimi-k3` |
 | `cborg` | same against LBL's CBORG gateway (`https://api.cborg.lbl.gov/v1`); `cborg-coder-max` is on-prem and unmetered, its reasoning is always on and counts against `max_tokens` | no | low, high, max | max, `cborg-coder-max` |
+| `reflection` | same against Reflection AI (`https://api.reflection.ai/openai/v1`); `Beam-1.0-501B-A23B`, reasoning mandatory and counted against `max_tokens`; during the open beta the org shares a free daily allowance (100k output tokens) that renews at 00:00 UTC | no | low, medium, high, xhigh, max | high, `Beam-1.0-501B-A23B` |
 | `local` | same as moonshot against `base_url` (default ollama) | no | ignored | model required |
 
 `--effort` takes the shared scale and is mapped per backend (`xhigh` and
 `max` become `high` on agy; `medium` becomes `high` and `xhigh` becomes `max`
-on kimi-k3 and cborg-coder-max, which have no medium).
+on kimi-k3 and cborg-coder-max, which have no medium; Beam takes all five).
 
 The literal command for every CLI run is written to `cmd.txt` in the run
 directory. For API runs `cmd.txt` holds the endpoint and the request body
@@ -325,9 +326,12 @@ fallback block arrives the served model is taken from it and
 the run with the category. `max_tokens` and `model_context_window_exceeded`
 stops are marked in the result. Default `max_tokens` is 64000.
 
-**moonshot / cborg / local.** OpenAI-compatible chat completions. Moonshot gets
-`max_completion_tokens` and, for kimi-k3 only, `reasoning_effort`; cborg and local
-get `max_tokens`, cborg also `reasoning_effort`. CAVEAT (cborg): the gateway
+**moonshot / cborg / reflection / local.** OpenAI-compatible chat completions. Moonshot gets
+`max_completion_tokens` and, for kimi-k3 only, `reasoning_effort`; cborg, reflection and local
+get `max_tokens`, cborg and reflection also `reasoning_effort` (reflection passes
+the full scale through; a `daily_allowance_exhausted` 429 is the beta allowance,
+renewing at 00:00 UTC, and `insufficient_credits` / `prepaid_balance_exhausted`
+mean the prepaid balance needs a manual top-up). CAVEAT (cborg): the gateway
 gates by source IP before auth, and self-service IP entries expire after 30
 days, so a `403 ip_not_authorized` is an IP problem, not a key problem. `stream_options.include_usage` asks for a final usage
 chunk; providers that ignore it leave `usage` null. Streamed
@@ -352,6 +356,7 @@ Defaults:
 - anthropic: `~/.config/antagonist/anthropic.key` or `$ANTHROPIC_API_KEY`
 - moonshot: `~/.config/antagonist/moonshot.key` or `$MOONSHOT_API_KEY`
 - cborg: `~/.config/antagonist/cborg.key` or `$CBORG_API_KEY`
+- reflection: `~/.config/antagonist/reflection.key` or `$REFLECTION_API_KEY`
 
 Keys kept elsewhere need only a `key_file` line per backend in the
 config file; the defaults above are a convention, not a requirement. A key
@@ -372,7 +377,7 @@ agy also `tools`, `web`, `retries`, `nudges`, `linger`, `stall`, `quota_pause` a
 `preflight_deadline`. `ANTAGONIST_CONFIG`, `ANTAGONIST_RUNS`,
 `ANTAGONIST_CACHE` and `ANTAGONIST_AGY_SETTINGS` override the paths. `base_url`
 shapes differ by API: anthropic takes the host (`/v1/messages` is
-appended; a trailing `/v1` is stripped), moonshot, cborg and local take the
+appended; a trailing `/v1` is stripped), moonshot, cborg, reflection and local take the
 OpenAI-style root including `/v1` (`/chat/completions` is appended). A
 backend section may set its own `split_parallel` (cborg defaults to 5, the
 ceiling CBorg asks for on its on-prem models).
