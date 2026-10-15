@@ -97,3 +97,11 @@ The extra effort bought one additional minor finding and about half again
 as many reasoning tokens. Both runs left the prompt cache almost untouched
 (448 cached tokens on an identical 14.5k prompt six minutes apart), which
 is worth knowing before anyone proposes this model for a chat bot.
+
+Follow-ups applied the same day (after runs 2 and 3): the `--split` help text
+no longer says "CLI backends only" (README and skill say it works on any
+backend); `HINTS` gained entries for "no visible text in response" (budget
+spent on reasoning: raise `max_tokens` or lower the effort) and for a bare
+`HTTP 502/503/504` gateway error (check `/models`, wait or switch backend),
+with tests. The unreadable-key-file path and the first-key-wins rule stay
+as they were, by choice.

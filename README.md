@@ -102,7 +102,8 @@ is the file's). Relative evidence paths resolve against
 `--cwd`, not the invoking directory. `--no-preamble` sends the prompt text
 unchanged (no heading, no trimming); evidence is still appended.
 
-`--split` runs one review per group of claims and merges the results. The
+`--split` runs one review per group of claims and merges the results, on
+any backend (for an API backend each part is one request). The
 groups come from the numbered list under the first heading in the prompt
 that contains the word "claims" (`1.`, `2)`, `- **C3.**`): `--split auto`
 takes three claims per part, `auto:N` takes N, and `1,2/3,4,7/*` names the

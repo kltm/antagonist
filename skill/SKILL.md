@@ -94,6 +94,9 @@ prompt holds, so a prompt with many claims gets a shallow pass on each.
 them: `auto` takes three claims per part, or name the groups
 (`C1,C2/C3,C4,C7/*`, where `*` is every claim not named). Put claims that
 bear on each other in the same group, because no part sees two groups.
+It works on every backend, not only agy: an API backend runs each part as
+one request (cborg and reflection have run split reviews), and the limit
+that matters there is the daily output allowance, not requests per minute.
 The prompt needs its numbered claims under a heading that contains the
 word "claims". Add `--also-model gemini-3.8-flash` for anything with a
 production surface: the second model has found defects the first missed.

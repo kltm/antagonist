@@ -2531,6 +2531,14 @@ HINTS = [
     (re.compile(r"insufficient_credits|prepaid_balance_exhausted", re.I),
      "Reflection's prepaid balance is empty: top up at https://platform.reflection.ai/billing "
      "(a manual purchase; nothing recharges on its own)."),
+    (re.compile(r"no visible text in response", re.I),
+     "the output budget was spent on reasoning before any answer arrived (reasoning.md holds "
+     "what it thought). Raise max_tokens in the backend's config section, or rerun at a lower "
+     "--effort."),
+    (re.compile(r"HTTP 50[234] from", re.I),
+     "the backend's server did not answer (a gateway error, often a bare Cloudflare page). If its "
+     "/models endpoint still answers, the inference side is down: wait and rerun, or use another "
+     "backend."),
     (re.compile(r"went silent|incomplete", re.I),
      "the stream stalled or ended early. Rerun; at `high` rather than `max` for a "
      "long-reasoning API model."),
@@ -2796,7 +2804,8 @@ def main(argv=None):
     r.add_argument("--split", metavar="SPEC",
                    help="one run per group of claims, in parallel, merged into one result: "
                         "`auto` (3 claims per part), `auto:N`, or groups like `1,2/3,4,7/*` "
-                        "(`*` = every claim not named). CLI backends only")
+                        "(`*` = every claim not named). Any backend: each part is one run of it, "
+                        "`split_parallel` at once")
     r.add_argument("--also-model", action="append", default=[], metavar="MODEL",
                    help="with --split: run every part on this model as well (repeatable)")
     r.add_argument("--tools", choices=["auto", "read", "exec"],

@@ -761,6 +761,8 @@ class AgyGuidanceTests(unittest.TestCase):
             ("2 of 5 parts failed (03: x). Finished parts are in result.partial.md", "", "antagonist retry"),
             ("agy exited 3; see stderr.log", "AGY_ERROR: exceeded the output token limit", "--max-words"),
             ("codex exec exited 1; see stderr.log", "flagged for possible cybersecurity risk", "hardening review"),
+            ("no visible text in response (finish_reason=length)", "", "max_tokens"),
+            ("HTTP 502 from https://api.example.test/v1/chat/completions: error code: 502", "", "/models"),
             ("something else entirely", "", None)):
             rd = os.path.join(self.root, "20260101-000000-agy-" + str(abs(hash(err)) % 10**6))
             os.makedirs(rd)
