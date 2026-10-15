@@ -44,3 +44,28 @@ the substitution happens at execution) and named the gap it did not check
   only by the unit test's synthetic error event.
 - `fetch_preflight`'s reflection catalog job against the live endpoint (the
   unit test stubs it).
+
+## Run 2: reflection on its own backend commit (`2cb4e94`)
+
+Run dir: `~/.local/state/antagonist/runs/20261014-173728-reflection-reflection-self-review`
+`-b reflection --effort high --max-words 1500`, no split, 37 s, free.
+Evidence: the commit diff (script, example config, tests), the docs diff,
+and the unchanged functions and tables the change depends on, extracted by
+name. Eight claims, one verdict each; eight further findings.
+
+| finding | disposition |
+|---|---|
+| (major) an existing but unreadable key file raises before the `$REFLECTION_API_KEY` fallback | confirmed (`read_key_file` on a `chmod 000` file raises `PermissionError`), but pre-existing for every API backend and untouched by this commit; failing loudly on a present-but-unreadable key file is arguably right. Deferred: if changed, report "key file unreadable" rather than fall back silently |
+| several `*KEY`/`*TOKEN`/`*SECRET` assignments: the first wins, no preference for the backend's own name | confirmed as the documented rule (README, Credentials); the operator's file has one assignment. No change |
+| a vendor error body that echoed the request header would carry the key into the exception text | refuted in effect: `meta["error"]` is written through `secrets.redact` (line 2431) and every `status` print redacts; configured key values are in the redaction set |
+| the other documented codes (403, 409, 503) reach the operator as the raw HTTP error | accepted: the vendor's `message` text in the body names the fix; only the three codes a reviewer is likely to hit got a rewrite |
+| a benign `daily_allowance_exhausted` in `stderr.log` would fire the hint | confirmed for CLI backends in principle (every `HINTS` entry shares this), negligible for API runs: `_write_api_cmd` empties `stderr.log` (line 1426) |
+| `length` finish with reasoning but no content gives "no visible text" and no allowance hint | confirmed, pre-existing (the cborg tests cover it). Deferred: a `HINTS` entry for "no visible text" naming `max_tokens` and effort would help every reasoning backend |
+| where `norm_effort` is called, and with which model | verified: `cmd_run` resolves `args.model or b.get("model")` before calling it (line 2159), so the default `Beam-1.0-501B-A23B` matches `^beam-` under `re.I`; the smoke run's `cmd.txt` shows `reasoning_effort` sent with no `--model` given |
+| whether `--split` applies to API backends | **doc defect found**: the `--split` help text says "CLI backends only", but `cmd_run` never refuses it for an API backend, and the 2026-10-09 cborg runs used `--split auto`. Claim 6's premise was wrong; the rate-limit arithmetic still holds (6 parts at once against 30 requests/minute), and the real cost of a split on this backend is the shared output allowance. Fix pending: the help string and the skill table |
+| `~` in `key_file` | verified: `backends` prints the expanded path |
+
+Untested after this run: a live 429 or 402, the live catalog job, `--split` on
+this backend. Reviewer's own evidence status: it cited line numbers from the
+pasted excerpts for every holding claim and marked the three it could not
+see as undetermined, which matched what was missing from the evidence.
