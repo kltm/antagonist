@@ -69,3 +69,31 @@ Untested after this run: a live 429 or 402, the live catalog job, `--split` on
 this backend. Reviewer's own evidence status: it cited line numbers from the
 pasted excerpts for every holding claim and marked the three it could not
 see as undetermined, which matched what was missing from the evidence.
+
+## Run 3: the same prompt at `max`
+
+Run dir: `~/.local/state/antagonist/runs/20261014-174353-reflection-reflection-self-review-max`
+`-b reflection --effort max --max-words 1500`, 56 s, free. Same prompt and
+evidence as run 2, for a like-for-like comparison of the two efforts.
+
+| | run 2 (`high`) | run 3 (`max`) |
+|---|---|---|
+| duration | 37 s | 56 s |
+| prompt tokens | 14,573 (448 cached) | 14,573 (448 cached) |
+| output tokens | 8,112, of which 7,138 reasoning | 11,877, of which 10,932 reasoning |
+
+Findings: the same set as run 2 (unreadable key file as the one major;
+first key-ish assignment wins; `length` finish with no content lacks a
+diagnostic; `norm_effort` call site, `~` expansion, `status` hint path and
+`--split` gating marked as not determinable from the evidence), plus:
+
+| finding | disposition |
+|---|---|
+| claim 6 refuted on a different ground: `split_parallel` caps concurrency, nothing throttles requests over time, so parts could in principle exceed 30 per minute | accepted as literally true, immaterial in practice: a split has a handful of parts (three for an eight-claim prompt at `auto`, doubled by `--also-model`), far below 30 in any minute |
+| no `HINTS` entry for the bare Cloudflare `HTTP 502` seen in the outage | accepted as a cheap improvement, deferred with the "no visible text" hint: "the vendor's inference origin is down while `/models` answers; wait" |
+| claim 5 "cannot determine absolutely" (another capture layer might log the key) | honest; the redaction layer (line 2431 and the `status` prints) is outside the excerpts and answers it |
+
+The extra effort bought one additional minor finding and about half again
+as many reasoning tokens. Both runs left the prompt cache almost untouched
+(448 cached tokens on an identical 14.5k prompt six minutes apart), which
+is worth knowing before anyone proposes this model for a chat bot.
